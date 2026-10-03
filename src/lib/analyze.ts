@@ -4,11 +4,15 @@ import { structuredCall } from "./claude";
 import { UserError } from "./http";
 import { METRIC_INFO, formatMetric, type MetricKey, type Metrics } from "./metrics";
 import { evaluateRules } from "./rules";
-import { AREAS, AREA_LABELS, AnalysisSchema, VERDICT_LABELS, type AnalysisResponse, type KnowledgeEntry, type RuleResult } from "./schema";
+import { allSourceBlocks } from "./materials";
+import { AnalysisSchema, VERDICT_LABELS, categoryName, type AnalysisResponse, type Category, type Database, type KnowledgeEntry, type RuleResult } from "./schema";
 import { buildReport } from "./scoring";
 import { readDb } from "./store";
 
-const ANALYSIS_SYSTEM = `Oceniasz twarz ze zdjęć dla użytkownika aplikacji. Jedynym źródłem wiedzy, kryteriów i zaleceń jest baza wiedzy autora aplikacji w <baza_wiedzy>.
+/** Do tego rozmiaru pełne materiały autora są dołączane do każdej analizy twarzy (z cache). */
+const FULL_MATERIALS_LIMIT = 300_000;
+
+const ANALYSIS_SYSTEM = `Oceniasz twarz ze zdjęć dla użytkownika aplikacji. Jedynym źródłem wiedzy, kryteriów i zaleceń są materiały autora aplikacji: uporządkowana baza wiedzy w <baza_wiedzy>, opis jego systemu oceny w <system_oceny_autora> oraz - jeśli są dołączone - pełne oryginalne materiały (<materialy_autora>). Gdy wpis bazy jest skrótowy lub niejasny, sprawdź szczegóły w pełnych materiałach.
 
 Jak pracujesz:
 1. Przejdź przez KAŻDY wpis bazy po kolei i zwróć dla niego dokładnie jeden element w assessments (entryId = ID wpisu).
@@ -23,7 +27,8 @@ Jak pracujesz:
 7. Pomiary są przybliżone (zależą od zdjęcia, kąta i obiektywu) - podano ich niepewność (±). Problemy ze zdjęciem opisz w photoQuality.
 8. Pisz po polsku, rzeczowo i z szacunkiem, bez obraźliwych określeń. Przy zabiegach medycznych zaznacz w personalNote konsultację ze specjalistą.
 9. Oceniasz wyłącznie wygląd wg bazy. Nie zgaduj tożsamości, pochodzenia etnicznego, wieku, stanu zdrowia ani innych cech wrażliwych.
-10. observation i personalNote: zwięźle, maksymalnie 2 zdania.`;
+10. observation i personalNote: zwięźle, maksymalnie 2 zdania. Używaj terminologii autora.
+11. Ocena ma odzwierciedlać sposób oceniania autora (opisany w <system_oceny_autora>), nie Twój.`;
 
 function formatRange(r: KnowledgeEntry["ranges"][number], unit: string) {
   const lo = r.min == null ? "" : `od ${r.min}${unit}`;
@@ -32,21 +37,45 @@ function formatRange(r: KnowledgeEntry["ranges"][number], unit: string) {
 }
 
 /** Baza w formie czytelnej dla modelu: zalecenia ponumerowane, żeby model mógł je wskazać. */
-export function knowledgeForAnalysis(entries: KnowledgeEntry[]) {
-  return AREAS.flatMap((area) =>
-    entries
-      .filter((e) => e.area === area)
-      .map((e) => {
-        const lines = [`[${e.id}] ${e.title} (obszar: ${AREA_LABELS[e.area]}, priorytet ${e.priority}/5)`, `Zasada: ${e.content}`];
-        if (e.assessmentCriteria) lines.push(`Jak oceniać: ${e.assessmentCriteria}`);
-        if (e.metric && e.ranges.length) {
-          const unit = METRIC_INFO[e.metric].unit;
-          lines.push(`Pomiar ${e.metric}: ${e.ranges.map((r) => formatRange(r, unit)).join("; ")}`);
-        }
-        if (e.recommendations.length) lines.push("Zalecenia:", ...e.recommendations.map((r, i) => `  [${i}] ${r}`));
-        return lines.join("\n");
-      }),
-  ).join("\n\n");
+export function knowledgeForAnalysis(entries: KnowledgeEntry[], categories: Category[]) {
+  const order = [...new Set([...categories.map((c) => c.id), ...entries.map((e) => e.area)])];
+  return order
+    .flatMap((area) =>
+      entries
+        .filter((e) => e.area === area)
+        .map((e) => {
+          const lines = [`[${e.id}] ${e.title} (kategoria: ${categoryName(categories, e.area)}, priorytet ${e.priority}/5)`, `Zasada: ${e.content}`];
+          if (e.assessmentCriteria) lines.push(`Jak oceniać: ${e.assessmentCriteria}`);
+          if (e.metric && e.ranges.length) {
+            const unit = METRIC_INFO[e.metric].unit;
+            lines.push(`Pomiar ${e.metric}: ${e.ranges.map((r) => formatRange(r, unit)).join("; ")}`);
+          }
+          if (e.recommendations.length) lines.push("Zalecenia:", ...e.recommendations.map((r, i) => `  [${i}] ${r}`));
+          return lines.join("\n");
+        }),
+    )
+    .join("\n\n");
+}
+
+function frameworkText(db: Database) {
+  const cats = db.categories.map((c) => `- ${c.name} (waga ${c.weight}/5)${c.description ? `: ${c.description}` : ""}`).join("\n");
+  const f = db.framework;
+  return [
+    f?.summary ? `Założenia autora:\n${f.summary}` : "",
+    f?.scoringNotes ? `Jak autor ocenia:\n${f.scoringNotes}` : "",
+    cats ? `Kategorie oceny:\n${cats}` : "",
+    f?.contradictions.length ? `Sprzeczności w materiałach (nie rozstrzygaj ich, zaznacz niepewność):\n${f.contradictions.map((c) => `- ${c}`).join("\n")}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+/** Czy dołączać pełne materiały: tylko gdy są przeanalizowane i mieszczą się w limicie. */
+function shouldIncludeMaterials(db: Database) {
+  if (db.sources.length === 0) return false;
+  const tokens = db.framework?.materialTokens;
+  if (tokens != null) return tokens <= FULL_MATERIALS_LIMIT;
+  return db.sources.reduce((s, x) => s + x.size, 0) < 1_500_000;
 }
 
 function measurementsText(metrics: Metrics, spreads: Partial<Record<MetricKey, number>>, samples: number) {
@@ -79,10 +108,19 @@ export async function analyzeFace(input: {
 
   const rules = evaluateRules(db.entries, input.metrics, input.spreads);
 
-  const content: Anthropic.Beta.BetaContentBlockParam[] = [
+  const content: Anthropic.Beta.BetaContentBlockParam[] = [];
+  const includeMaterials = shouldIncludeMaterials(db);
+  if (includeMaterials) {
+    const materials = await allSourceBlocks(db.sources);
+    content.push({ type: "text", text: "<materialy_autora>" }, ...materials, { type: "text", text: "</materialy_autora>" });
+    // Materiały są takie same dla każdej analizy - cache obniża koszt i czas kolejnych analiz.
+    const last = content[content.length - 1] as Anthropic.Beta.BetaTextBlockParam;
+    last.cache_control = { type: "ephemeral" };
+  }
+  content.push(
     { type: "text", text: "Zdjęcie przodu twarzy:" },
     { type: "image", source: { type: "base64", media_type: input.front.mediaType, data: input.front.data } },
-  ];
+  );
   if (input.profile) {
     content.push(
       { type: "text", text: "Zdjęcie profilu:" },
@@ -107,12 +145,16 @@ export async function analyzeFace(input: {
     system: [
       { type: "text", text: ANALYSIS_SYSTEM },
       // Baza jest taka sama dla każdego użytkownika - cache obniża koszt i czas kolejnych analiz.
-      { type: "text", text: `<baza_wiedzy>\n${knowledgeForAnalysis(db.entries)}\n</baza_wiedzy>`, cache_control: { type: "ephemeral" } },
+      {
+        type: "text",
+        text: `<system_oceny_autora>\n${frameworkText(db)}\n</system_oceny_autora>\n\n<baza_wiedzy>\n${knowledgeForAnalysis(db.entries, db.categories)}\n</baza_wiedzy>`,
+        cache_control: { type: "ephemeral" },
+      },
     ],
     content,
     effort: "high",
     maxTokens: 128000,
   });
 
-  return buildReport(db.entries, analysis, rules);
+  return buildReport(db.entries, analysis, rules, db.categories, includeMaterials);
 }

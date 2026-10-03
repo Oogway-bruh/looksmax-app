@@ -31,16 +31,25 @@ Zapis do PDF (drukowanie). Historia analiz w przeglądarce z porównaniem dwóch
 
 ## Baza wiedzy (`/admin`)
 
-- **Wgrywanie materiałów:** .txt / .md, zdjęcia notatek/grafik, PDF - wiele naraz. Claude zamienia każdy plik
-  na wpisy (obszar, zasada, kryteria oceny, opcjonalnie progi liczbowe, zalecenia, priorytet 1-5), bez dodawania
-  czegokolwiek od siebie.
-- **Porządkowanie:** łączy duplikaty (osobno w każdym obszarze, więc działa przy dużych bazach), oznacza
-  sprzeczności i ustawia priorytety. Najpierw pokazuje **propozycję** (co połączono, co zostanie usunięte) -
-  baza zmienia się dopiero po zatwierdzeniu; kopia trafia do `data/backups/`.
-- **Pokrycie bazy:** ile wpisów ma każdy obszar, które pomiary mają progi, którym wpisom brakuje kryteriów lub zaleceń.
-- Ręczna edycja wpisów (w tym progów), usuwanie materiałów, eksport/import JSON.
+Ocena opiera się wyłącznie na materiałach autora - aplikacja dopasowuje się do nich, a nie odwrotnie.
 
-Baza jest przechowywana w pliku `data/db.json` (poza gitem).
+1. **Twoje materiały:** wgrywasz pliki (.txt, .md, .csv, .docx, .pdf, zdjęcia notatek/zrzuty ekranu .jpg/.png/.webp),
+   wiele naraz lub przeciągając. Pliki są przechowywane w całości w `data/sources/`.
+2. **Analiza materiałów:** Claude czyta **wszystkie materiały naraz, w całości** (do ~650 tys. tokenów w jednym
+   zapytaniu; większe zbiory są czytane w częściach i składane) i buduje z nich system oceny autora:
+   - opis, jak autor ocenia wygląd, i jak przekłada cechy na ocenę,
+   - **kategorie autora** (jego nazwy i podział) z wagami w ocenie ogólnej,
+   - wszystkie zasady z progami, kryteriami oceny i zaleceniami, z odnośnikiem do plików źródłowych,
+   - sprzeczności między materiałami, braki i nieczytelne fragmenty.
+   Wynik to propozycja - baza zmienia się dopiero po zatwierdzeniu (kopia trafia do `data/backups/`). Analiza
+   działa w tle z podglądem postępu.
+3. **System oceny:** podgląd i edycja kategorii (nazwa, waga), ręczna edycja wpisów. Ręczne poprawki są
+   zachowywane przy kolejnej analizie materiałów.
+
+Przy analizie twarzy Claude dostaje uporządkowaną bazę, opis systemu oceny autora i - jeśli materiały mają
+do ~300 tys. tokenów - **pełne oryginalne materiały** (z cache, więc kolejne analizy są tańsze i szybsze).
+
+Panel jest chroniony hasłem (`ADMIN_PASSWORD`) - strona logowania pod `/login`.
 
 ## Uruchomienie lokalne
 
@@ -51,14 +60,14 @@ npm run dev
 ```
 
 - http://localhost:3000 - analiza zdjęcia
-- http://localhost:3000/admin - baza wiedzy (hasło z `ADMIN_PASSWORD`; w trybie dev bez hasła)
+- http://localhost:3000/admin - baza wiedzy (hasło z `ADMIN_PASSWORD`)
 
 Kamera wymaga HTTPS (lub localhost).
 
 ## Testy
 
 ```bash
-npm test          # pomiary (na prawdziwych danych MediaPipe), jakość zdjęć, reguły i scoring
+npm test          # pomiary (na prawdziwych danych MediaPipe), jakość zdjęć, reguły, scoring, kategorie, migracja bazy
 npm run typecheck
 npm run lint
 ```
@@ -71,6 +80,7 @@ prywatności (dane biometryczne, art. 9 RODO).
 
 ## Wdrożenie - do zrobienia
 
-Plikowa baza działa na serwerze ze stałym dyskiem (VPS, Railway, Render z dyskiem). Przy hostingu bez dysku
-(np. Vercel) trzeba wymienić `src/lib/store.ts` na Postgresa (np. Supabase) - reszta kodu korzysta tylko z
-funkcji `readDb` / `updateDb`.
+Baza (`data/db.json`) i materiały (`data/sources/`) są plikami na dysku - działa to na serwerze ze stałym
+dyskiem (VPS, Railway, Render z dyskiem). Przy hostingu bez dysku (np. Vercel) trzeba wymienić `src/lib/store.ts`
+na Postgres + Storage (np. Supabase). Analiza materiałów działa jako zadanie w tle w procesie serwera, więc
+wymaga serwera działającego stale (nie funkcji serverless).

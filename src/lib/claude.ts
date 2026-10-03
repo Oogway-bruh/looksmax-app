@@ -7,6 +7,20 @@ export const MODEL = process.env.CLAUDE_MODEL ?? "claude-opus-5-5";
 const client = new Anthropic();
 
 export class ClaudeRefusalError extends Error {}
+export class ClaudeTruncatedError extends Error {}
+
+function requireKey() {
+  if (!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
+    throw new Error("Brak klucza API Anthropic - ustaw ANTHROPIC_API_KEY w pliku .env.local i uruchom aplikację ponownie.");
+  }
+}
+
+/** Dokładny rozmiar zapytania w tokenach (bez wysyłania go do modelu). */
+export async function countTokens(system: string, content: Anthropic.Beta.BetaContentBlockParam[]): Promise<number> {
+  requireKey();
+  const res = await client.beta.messages.countTokens({ model: MODEL, system, messages: [{ role: "user", content }] });
+  return res.input_tokens;
+}
 
 /** Schemat Zod -> JSON Schema dla structured outputs (z zachowaniem enumów i bez dodatkowych pól). */
 function toOutputSchema(schema: z.ZodType): Record<string, unknown> {
@@ -34,10 +48,10 @@ export async function structuredCall<S extends z.ZodType>(opts: {
   content: Anthropic.Beta.BetaContentBlockParam[];
   effort?: "low" | "medium" | "high" | "xhigh" | "max";
   maxTokens?: number;
+  /** Wywoływane z kolejnymi fragmentami odpowiedzi (do pokazywania postępu) */
+  onText?: (chunk: string) => void;
 }): Promise<z.infer<S>> {
-  if (!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
-    throw new Error("Brak klucza API Anthropic - ustaw ANTHROPIC_API_KEY w pliku .env.local.");
-  }
+  requireKey();
   const stream = client.beta.messages.stream({
     model: MODEL,
     max_tokens: opts.maxTokens ?? 64000,
@@ -48,13 +62,14 @@ export async function structuredCall<S extends z.ZodType>(opts: {
     system: opts.system,
     messages: [{ role: "user", content: opts.content }],
   });
+  if (opts.onText) stream.on("text", opts.onText);
   const message = await stream.finalMessage();
 
   if (message.stop_reason === "refusal") {
     throw new ClaudeRefusalError("Model odmówił przetworzenia tego materiału.");
   }
   if (message.stop_reason === "max_tokens") {
-    throw new Error("Odpowiedź modelu została ucięta (za dużo danych naraz) - podziel materiał na mniejsze części.");
+    throw new ClaudeTruncatedError("Odpowiedź modelu została ucięta (za dużo danych naraz).");
   }
   const text = message.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("");
   try {

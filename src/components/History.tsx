@@ -3,7 +3,6 @@
 import { useState } from "react";
 import { METRIC_INFO, METRIC_KEYS } from "@/lib/metrics";
 import { clearHistory, removeFromHistory, type HistoryItem } from "@/lib/history";
-import { AREA_LABELS } from "@/lib/schema";
 import { Report, scoreColor } from "./Report";
 
 const date = (iso: string) => new Date(iso).toLocaleString("pl-PL", { dateStyle: "medium", timeStyle: "short" });
@@ -83,7 +82,7 @@ export function History({ items, onChange }: { items: HistoryItem[]; onChange: (
               {newer.report.areas.map((area) => (
                 <Row
                   key={area.area}
-                  label={AREA_LABELS[area.area]}
+                  label={area.name ?? area.area}
                   a={older.report.areas.find((x) => x.area === area.area)?.score ?? null}
                   b={area.score}
                   higherIsBetter

@@ -1,5 +1,5 @@
 import { METRIC_INFO, formatMetric, type MetricKey, type MetricStat, type Metrics } from "@/lib/metrics";
-import { AREA_LABELS, VERDICT_LABELS, type AnalysisResponse, type AssessedEntry } from "@/lib/schema";
+import { VERDICT_LABELS, type AnalysisResponse, type AssessedEntry } from "@/lib/schema";
 
 const CONFIDENCE_LABELS = { low: "niska pewność", medium: "średnia pewność", high: "" } as const;
 
@@ -64,7 +64,7 @@ function EntryDetail({ e, showArea = false }: { e: AssessedEntry; showArea?: boo
     <div className="space-y-2">
       <div className="flex flex-wrap items-baseline gap-2">
         <span className="font-medium">{e.title}</span>
-        {showArea && <Tag>{AREA_LABELS[e.area]}</Tag>}
+        {showArea && <Tag>{e.areaName ?? e.area}</Tag>}
         <Tag className="font-mono">{e.entryId}</Tag>
         {CONFIDENCE_LABELS[e.confidence] && <Tag className="text-amber-300/80">{CONFIDENCE_LABELS[e.confidence]}</Tag>}
         {e.score != null && (
@@ -120,8 +120,9 @@ export function Report({
           <p className="text-neutral-200 print:text-neutral-900">{data.summary}</p>
           <p className="text-xs text-neutral-500">
             Ocenione {data.coverage.assessed} z {data.coverage.totalEntries} wpisów bazy wiedzy
-            {data.coverage.ruleBased > 0 && `, w tym ${data.coverage.ruleBased} z pomiarów wg Twoich progów`}. Wynik to średnia ważona
-            priorytetem wpisów.
+            {data.coverage.ruleBased > 0 && `, w tym ${data.coverage.ruleBased} z pomiarów wg progów z bazy`}
+            {data.coverage.usedFullMaterials && "; analiza z pełnymi materiałami autora"}. Wynik to średnia ważona priorytetem cech i wagą
+            kategorii.
           </p>
         </div>
       </section>
@@ -166,13 +167,13 @@ export function Report({
       )}
 
       <section>
-        <h2 className="mb-3 text-lg font-semibold">Obszary</h2>
+        <h2 className="mb-3 text-lg font-semibold">Kategorie</h2>
         <div className="grid gap-4 md:grid-cols-2">
           {data.areas.map((a) => (
             <details key={a.area} className={`${section} group`}>
               <summary className="cursor-pointer list-none">
                 <div className="flex items-baseline justify-between">
-                  <h3 className="font-semibold">{AREA_LABELS[a.area]}</h3>
+                  <h3 className="font-semibold">{a.name ?? a.area}</h3>
                   <span className={`font-mono ${scoreColor(a.score)}`}>{a.score ?? "–"}/10</span>
                 </div>
                 {a.score != null && (

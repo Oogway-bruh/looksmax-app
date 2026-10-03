@@ -36,8 +36,13 @@ export function FaceApp() {
   const [elapsed, setElapsed] = useState(0);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const abortRef = useRef<AbortController | null>(null);
+  const [status, setStatus] = useState<{ apiKeyConfigured: boolean; entries: number } | null>(null);
 
   useEffect(() => {
+    fetch("/api/status")
+      .then((r) => r.json())
+      .then(setStatus)
+      .catch(() => undefined);
     setHistory(loadHistory());
     // Na telefonach domyślnie kamera - prowadzi krok po kroku do dobrego ujęcia.
     if (window.matchMedia("(pointer: coarse)").matches) setMode("camera");
@@ -133,6 +138,24 @@ export function FaceApp() {
           </button>
         ))}
       </nav>
+
+      {status && (status.entries === 0 || !status.apiKeyConfigured) && (
+        <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-4 text-sm text-amber-100 print:hidden">
+          {!status.apiKeyConfigured ? (
+            <p>
+              <b>Brak klucza API Anthropic.</b> Dopisz <code>ANTHROPIC_API_KEY=sk-ant-…</code> w pliku <code>.env.local</code> i uruchom aplikację ponownie.
+            </p>
+          ) : (
+            <p>
+              <b>Baza wiedzy jest pusta.</b> Ocena opiera się wyłącznie na Twoich materiałach - najpierw wgraj je i przeanalizuj w zakładce{" "}
+              <a href="/admin" className="underline">
+                Baza wiedzy
+              </a>
+              . Skanowanie twarzy działa już teraz, ale analiza wymaga bazy.
+            </p>
+          )}
+        </div>
+      )}
 
       {tab === "history" && <History items={history} onChange={setHistory} />}
 

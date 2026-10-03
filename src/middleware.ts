@@ -1,23 +1,24 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { SESSION_COOKIE, adminPassword, safeEqual, sessionToken } from "./lib/auth";
 
-// Panel administratora i API bazy wiedzy chronione hasłem (HTTP Basic Auth).
-// Login dowolny, hasło = ADMIN_PASSWORD. Bez ustawionego hasła panel działa tylko w trybie deweloperskim.
-export function middleware(req: NextRequest) {
-  const password = process.env.ADMIN_PASSWORD;
+// Panel bazy wiedzy i jego API wymagają zalogowania (hasło = ADMIN_PASSWORD).
+// Bez ustawionego hasła panel jest otwarty tylko w trybie deweloperskim (npm run dev).
+export async function middleware(req: NextRequest) {
+  const password = adminPassword();
+  const isApi = req.nextUrl.pathname.startsWith("/api/");
   if (!password) {
     if (process.env.NODE_ENV !== "production") return NextResponse.next();
-    return new NextResponse("Ustaw zmienną ADMIN_PASSWORD, aby włączyć panel administratora.", { status: 503 });
+    const msg = "Ustaw zmienną ADMIN_PASSWORD, aby włączyć panel bazy wiedzy.";
+    return isApi ? NextResponse.json({ error: msg }, { status: 503 }) : new NextResponse(msg, { status: 503 });
   }
-  const header = req.headers.get("authorization") ?? "";
-  const [scheme, encoded] = header.split(" ");
-  if (scheme === "Basic" && encoded) {
-    const decoded = atob(encoded);
-    if (decoded.slice(decoded.indexOf(":") + 1) === password) return NextResponse.next();
-  }
-  return new NextResponse("Wymagane logowanie", {
-    status: 401,
-    headers: { "WWW-Authenticate": 'Basic realm="Panel bazy wiedzy"' },
-  });
+  const cookie = req.cookies.get(SESSION_COOKIE)?.value ?? "";
+  if (cookie && safeEqual(cookie, await sessionToken(password))) return NextResponse.next();
+
+  if (isApi) return NextResponse.json({ error: "Zaloguj się ponownie do panelu bazy wiedzy." }, { status: 401 });
+  const url = req.nextUrl.clone();
+  url.pathname = "/login";
+  url.search = `?next=${encodeURIComponent(req.nextUrl.pathname)}`;
+  return NextResponse.redirect(url);
 }
 
 export const config = { matcher: ["/admin/:path*", "/api/knowledge/:path*"] };

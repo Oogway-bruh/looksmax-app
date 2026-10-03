@@ -10,7 +10,8 @@ export async function PUT(req: Request, { params }: { params: Promise<{ id: stri
     const entry = await updateDb((db) => {
       const existing = db.entries.find((e) => e.id === id);
       if (!existing) return null;
-      Object.assign(existing, draft, { updatedAt: new Date().toISOString() });
+      // Ręczna poprawka - ponowna analiza materiałów ją zachowa.
+      Object.assign(existing, draft, { updatedAt: new Date().toISOString(), manual: true });
       return existing;
     });
     if (!entry) return NextResponse.json({ error: "Nie ma takiego wpisu." }, { status: 404 });

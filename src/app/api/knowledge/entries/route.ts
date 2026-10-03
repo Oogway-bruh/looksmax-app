@@ -8,7 +8,7 @@ export async function POST(req: Request) {
   try {
     const draft = DraftEntrySchema.parse(await req.json());
     const entry = await updateDb((db) => {
-      const e = newEntry(db, draft, []);
+      const e = newEntry(db, draft, [], true);
       db.entries.push(e);
       return e;
     });
