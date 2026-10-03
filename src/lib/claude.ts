@@ -33,13 +33,14 @@ export async function structuredCall<S extends z.ZodType>(opts: {
   system: Anthropic.Beta.BetaTextBlockParam[];
   content: Anthropic.Beta.BetaContentBlockParam[];
   effort?: "low" | "medium" | "high" | "xhigh" | "max";
+  maxTokens?: number;
 }): Promise<z.infer<S>> {
   if (!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
     throw new Error("Brak klucza API Anthropic - ustaw ANTHROPIC_API_KEY w pliku .env.local.");
   }
   const stream = client.beta.messages.stream({
     model: MODEL,
-    max_tokens: 64000,
+    max_tokens: opts.maxTokens ?? 64000,
     // Przy odmowie przez filtry bezpieczeństwa API samo ponawia zapytanie na zalecanym modelu zapasowym.
     betas: ["server-side-fallback-2026-07-01"],
     fallbacks: "default",

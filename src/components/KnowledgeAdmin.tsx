@@ -2,7 +2,17 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { METRIC_INFO, METRIC_KEYS, type MetricKey } from "@/lib/metrics";
-import { AREAS, AREA_LABELS, VERDICTS, VERDICT_LABELS, type Area, type Database, type DraftEntry, type KnowledgeEntry } from "@/lib/schema";
+import {
+  AREAS,
+  AREA_LABELS,
+  VERDICTS,
+  VERDICT_LABELS,
+  type Area,
+  type ConsolidationProposal,
+  type Database,
+  type DraftEntry,
+  type KnowledgeEntry,
+} from "@/lib/schema";
 
 type UploadStatus = { name: string; state: "waiting" | "working" | "done" | "error"; message?: string };
 
@@ -17,12 +27,18 @@ const EMPTY_DRAFT: DraftEntry = {
   priority: 3,
 };
 
+const UPLOAD_CONCURRENCY = 2;
+
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
-  const json = await res.json();
+  const json = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(json.error ?? `Błąd ${res.status}`);
   return json;
 }
+
+const card = "rounded-2xl border border-neutral-800 bg-neutral-900/60 p-6 space-y-4";
+const button = "rounded-lg bg-sky-500 px-4 py-2 font-semibold text-neutral-950 hover:bg-sky-400 disabled:opacity-50";
+const ghost = "rounded-lg border border-neutral-700 px-4 py-2 hover:bg-neutral-800 disabled:opacity-50";
 
 export function KnowledgeAdmin() {
   const [db, setDb] = useState<Database | null>(null);
@@ -41,29 +57,50 @@ export function KnowledgeAdmin() {
     const list = Array.from(files);
     setUploads(list.map((f) => ({ name: f.name, state: "waiting" })));
     setBusy("upload");
-    for (const [i, file] of list.entries()) {
-      const set = (s: Partial<UploadStatus>) => setUploads((u) => u.map((x, j) => (j === i ? { ...x, ...s } : x)));
-      set({ state: "working" });
-      try {
-        const form = new FormData();
-        form.append("file", file);
-        const r = await api<{ created: number; notes: string }>("/api/knowledge/ingest", { method: "POST", body: form });
-        set({ state: "done", message: `${r.created} wpisów${r.notes ? ` · uwagi: ${r.notes}` : ""}` });
-      } catch (e) {
-        set({ state: "error", message: (e as Error).message });
+    let next = 0;
+    const worker = async () => {
+      while (next < list.length) {
+        const i = next++;
+        const set = (s: Partial<UploadStatus>) => setUploads((u) => u.map((x, j) => (j === i ? { ...x, ...s } : x)));
+        set({ state: "working" });
+        try {
+          const form = new FormData();
+          form.append("file", list[i]);
+          const r = await api<{ created: number; notes: string }>("/api/knowledge/ingest", { method: "POST", body: form });
+          set({ state: "done", message: `${r.created} wpisów${r.notes ? ` · uwagi: ${r.notes}` : ""}` });
+        } catch (e) {
+          set({ state: "error", message: (e as Error).message });
+        }
+        await reload();
       }
+    };
+    await Promise.all(Array.from({ length: Math.min(UPLOAD_CONCURRENCY, list.length) }, worker));
+    setBusy(null);
+  }
+
+  async function proposeConsolidation() {
+    setBusy("consolidate");
+    setMessage("Przygotowuję propozycję uporządkowania… przy dużej bazie może to potrwać kilka minut.");
+    try {
+      await api<ConsolidationProposal>("/api/knowledge/consolidate", { method: "POST" });
+      setMessage(null);
       await reload();
+    } catch (e) {
+      setMessage((e as Error).message);
     }
     setBusy(null);
   }
 
-  async function runConsolidation() {
-    if (!confirm("Uporządkować całą bazę? Duplikaty zostaną połączone. Kopia obecnej bazy trafi do data/backups.")) return;
+  async function decideConsolidation(accept: boolean) {
     setBusy("consolidate");
-    setMessage("Porządkowanie bazy… przy dużej bazie może to potrwać kilka minut.");
     try {
-      const r = await api<{ before: number; after: number; changes: string[] }>("/api/knowledge/consolidate", { method: "POST" });
-      setMessage(`Gotowe: ${r.before} → ${r.after} wpisów.\n${r.changes.map((c) => `• ${c}`).join("\n")}`);
+      if (accept) {
+        const r = await api<{ before: number; after: number }>("/api/knowledge/consolidate", { method: "PUT" });
+        setMessage(`Zatwierdzono: ${r.before} → ${r.after} wpisów. Kopia poprzedniej bazy jest w data/backups.`);
+      } else {
+        await api("/api/knowledge/consolidate", { method: "DELETE" });
+        setMessage("Propozycja odrzucona - baza bez zmian.");
+      }
       await reload();
     } catch (e) {
       setMessage((e as Error).message);
@@ -76,6 +113,17 @@ export function KnowledgeAdmin() {
     try {
       await api("/api/knowledge/import", { method: "POST", headers: { "Content-Type": "application/json" }, body: await file.text() });
       setMessage("Zaimportowano bazę.");
+      await reload();
+    } catch (e) {
+      setMessage((e as Error).message);
+    }
+  }
+
+  async function deleteSource(id: string, name: string) {
+    if (!confirm(`Usunąć materiał „${name}” i wpisy, które pochodzą tylko z niego?`)) return;
+    try {
+      const r = await api<{ removedEntries: number }>(`/api/knowledge/sources/${id}`, { method: "DELETE" });
+      setMessage(`Usunięto materiał i ${r.removedEntries} wpisów.`);
       await reload();
     } catch (e) {
       setMessage((e as Error).message);
@@ -107,27 +155,31 @@ export function KnowledgeAdmin() {
   }, [db, filter]);
 
   const sourceName = new Map(db?.sources.map((s) => [s.id, s.filename]));
+  const pending = db?.pendingConsolidation;
 
   return (
     <div className="space-y-8">
-      <section className="rounded-2xl border border-neutral-800 bg-neutral-900/60 p-6 space-y-4">
+      <section className={card}>
         <h2 className="text-lg font-semibold">1. Wgraj materiały</h2>
         <p className="text-sm text-neutral-400">
-          Pliki .txt / .md, zdjęcia notatek lub grafik (.jpg, .png, .webp) i PDF-y. Każdy plik jest czytany, a zawarta w
-          nim wiedza zamieniana na uporządkowane wpisy - bez dodawania czegokolwiek spoza Twojego materiału.
+          Pliki .txt / .md, zdjęcia notatek lub grafik (.jpg, .png, .webp) i PDF-y - możesz zaznaczyć wiele naraz. Każdy plik
+          jest czytany, a zawarta w nim wiedza zamieniana na uporządkowane wpisy, bez dodawania czegokolwiek spoza materiału.
         </p>
         <input
           type="file"
           multiple
           accept=".txt,.md,.pdf,image/jpeg,image/png,image/webp,image/gif,text/plain,text/markdown,application/pdf"
           disabled={busy != null}
-          onChange={(e) => e.target.files && uploadFiles(e.target.files)}
+          onChange={(e) => {
+            if (e.target.files) uploadFiles(e.target.files);
+            e.target.value = "";
+          }}
           className="block text-sm file:mr-4 file:rounded-lg file:border-0 file:bg-sky-500 file:px-4 file:py-2 file:font-semibold file:text-neutral-950"
         />
         {uploads.length > 0 && (
           <ul className="space-y-1 text-sm">
-            {uploads.map((u) => (
-              <li key={u.name}>
+            {uploads.map((u, i) => (
+              <li key={`${u.name}-${i}`}>
                 <span className="font-mono">{u.name}</span> -{" "}
                 <span className={u.state === "error" ? "text-red-300" : u.state === "done" ? "text-emerald-300" : "text-neutral-400"}>
                   {{ waiting: "czeka", working: "przetwarzanie…", done: "gotowe", error: "błąd" }[u.state]}
@@ -139,34 +191,55 @@ export function KnowledgeAdmin() {
         )}
       </section>
 
-      <section className="rounded-2xl border border-neutral-800 bg-neutral-900/60 p-6 space-y-4">
+      <section className={card}>
         <h2 className="text-lg font-semibold">2. Uporządkuj bazę</h2>
         <p className="text-sm text-neutral-400">
-          Łączy duplikaty z różnych materiałów, oznacza sprzeczności i ustawia priorytety, żeby baza składała się z
-          kluczowych punktów. Uruchom po wgraniu nowej porcji materiałów.
+          Łączy duplikaty z różnych materiałów, oznacza sprzeczności (nie rozstrzyga ich za Ciebie) i ustawia priorytety. Najpierw
+          dostajesz propozycję - baza zmienia się dopiero po zatwierdzeniu.
         </p>
         <div className="flex flex-wrap gap-3">
-          <button
-            onClick={runConsolidation}
-            disabled={busy != null || !db?.entries.length}
-            className="rounded-lg bg-sky-500 px-4 py-2 font-semibold text-neutral-950 disabled:opacity-50"
-          >
-            {busy === "consolidate" ? "Porządkowanie…" : "Uporządkuj bazę"}
+          <button onClick={proposeConsolidation} disabled={busy != null || !db?.entries.length || !!pending} className={button}>
+            {busy === "consolidate" && !pending ? "Przygotowywanie…" : "Przygotuj propozycję"}
           </button>
-          <a href="/api/knowledge/export" className="rounded-lg border border-neutral-700 px-4 py-2">
+          <a href="/api/knowledge/export" className={ghost}>
             Eksport JSON
           </a>
-          <label className="cursor-pointer rounded-lg border border-neutral-700 px-4 py-2">
+          <label className={`${ghost} cursor-pointer`}>
             Import JSON
             <input type="file" accept="application/json" className="hidden" onChange={(e) => e.target.files?.[0] && importFile(e.target.files[0])} />
           </label>
         </div>
+        {pending && db && <ProposalView proposal={pending} db={db} busy={busy != null} onDecide={decideConsolidation} />}
         {message && <pre className="whitespace-pre-wrap rounded-lg bg-neutral-800/60 p-3 text-sm text-neutral-300">{message}</pre>}
       </section>
 
+      {db && db.entries.length > 0 && <Coverage db={db} />}
+
+      {db && db.sources.length > 0 && (
+        <section className={card}>
+          <h2 className="text-lg font-semibold">Materiały ({db.sources.length})</h2>
+          <ul className="divide-y divide-neutral-800 text-sm">
+            {db.sources.map((s) => (
+              <li key={s.id} className="flex items-center justify-between gap-3 py-2">
+                <div className="min-w-0">
+                  <span className="font-mono">{s.filename}</span>
+                  <span className="ml-2 text-neutral-500">
+                    {new Date(s.uploadedAt).toLocaleDateString("pl-PL")} · {s.entryCount} wpisów
+                  </span>
+                  {s.notes && <p className="truncate text-xs text-amber-300/80" title={s.notes}>Uwagi: {s.notes}</p>}
+                </div>
+                <button onClick={() => deleteSource(s.id, s.filename)} className="shrink-0 text-red-400 hover:text-red-300">
+                  Usuń
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       <section className="space-y-4">
         <div className="flex flex-wrap items-center gap-3">
-          <h2 className="text-lg font-semibold">Baza wiedzy ({db?.entries.length ?? 0} wpisów, {db?.sources.length ?? 0} materiałów)</h2>
+          <h2 className="text-lg font-semibold">Wpisy ({db?.entries.length ?? 0})</h2>
           <input
             placeholder="Szukaj…"
             value={filter}
@@ -180,7 +253,9 @@ export function KnowledgeAdmin() {
         {editing === "new" && <EntryEditor initial={EMPTY_DRAFT} onSave={(d) => saveEntry("new", d)} onCancel={() => setEditing(null)} />}
         {grouped.map(({ area, entries }) => (
           <div key={area}>
-            <h3 className="mb-2 mt-6 text-sm font-semibold uppercase tracking-wide text-neutral-400">{AREA_LABELS[area]}</h3>
+            <h3 className="mb-2 mt-6 text-sm font-semibold uppercase tracking-wide text-neutral-400">
+              {AREA_LABELS[area]} ({entries.length})
+            </h3>
             <div className="space-y-2">
               {entries.map((e) =>
                 editing === e.id ? (
@@ -200,6 +275,120 @@ export function KnowledgeAdmin() {
         ))}
       </section>
     </div>
+  );
+}
+
+function ProposalView({
+  proposal,
+  db,
+  busy,
+  onDecide,
+}: {
+  proposal: ConsolidationProposal;
+  db: Database;
+  busy: boolean;
+  onDecide: (accept: boolean) => void;
+}) {
+  const referenced = new Set(proposal.entries.flatMap((e) => e.mergedFrom));
+  const removed = db.entries.filter((e) => proposal.basedOn.includes(e.id) && !referenced.has(e.id));
+  const merges = proposal.entries.filter((e) => e.mergedFrom.length > 1);
+  const addedSince = db.entries.filter((e) => !proposal.basedOn.includes(e.id)).length;
+  const title = new Map(db.entries.map((e) => [e.id, e.title]));
+
+  return (
+    <div className="space-y-4 rounded-xl border border-sky-500/40 bg-sky-500/5 p-4 text-sm">
+      <p className="font-semibold">
+        Propozycja: {proposal.basedOn.length} → {proposal.entries.length} wpisów
+        <span className="ml-2 font-normal text-neutral-400">({new Date(proposal.createdAt).toLocaleString("pl-PL")})</span>
+      </p>
+      {addedSince > 0 && <p className="text-neutral-400">{addedSince} wpisów dodanych po przygotowaniu propozycji zostanie zachowanych bez zmian.</p>}
+      {proposal.changes.length > 0 && (
+        <ul className="list-disc space-y-1 pl-5 text-neutral-300">
+          {proposal.changes.map((c, i) => (
+            <li key={i}>{c}</li>
+          ))}
+        </ul>
+      )}
+      {merges.length > 0 && (
+        <details>
+          <summary className="cursor-pointer text-neutral-300">Połączone wpisy ({merges.length})</summary>
+          <ul className="mt-2 space-y-1 text-neutral-400">
+            {merges.map((m, i) => (
+              <li key={i}>
+                <b className="text-neutral-200">{m.title}</b> ← {m.mergedFrom.map((id) => `${id} ${title.get(id) ?? ""}`).join(", ")}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+      {removed.length > 0 && (
+        <details open>
+          <summary className="cursor-pointer text-amber-300">Wpisy do usunięcia ({removed.length}) - sprawdź!</summary>
+          <ul className="mt-2 space-y-1 text-neutral-400">
+            {removed.map((e) => (
+              <li key={e.id}>
+                {e.id} {e.title}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+      <div className="flex gap-3">
+        <button onClick={() => onDecide(true)} disabled={busy} className={button}>
+          Zatwierdź
+        </button>
+        <button onClick={() => onDecide(false)} disabled={busy} className={ghost}>
+          Odrzuć
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** Pokrycie bazy: które obszary i pomiary mają kryteria - pokazuje, czego brakuje. */
+function Coverage({ db }: { db: Database }) {
+  const byArea = AREAS.map((area) => ({ area, count: db.entries.filter((e) => e.area === area).length }));
+  const metricsWithRules = new Set(db.entries.filter((e) => e.metric && e.ranges.length).map((e) => e.metric!));
+  const noCriteria = db.entries.filter((e) => !e.assessmentCriteria && !(e.metric && e.ranges.length)).length;
+  const noRecs = db.entries.filter((e) => e.recommendations.length === 0).length;
+  const maxCount = Math.max(...byArea.map((a) => a.count), 1);
+
+  return (
+    <section className={card}>
+      <h2 className="text-lg font-semibold">Pokrycie bazy</h2>
+      <div className="grid gap-6 md:grid-cols-2">
+        <div className="space-y-1.5 text-sm">
+          {byArea.map(({ area, count }) => (
+            <div key={area} className="flex items-center gap-2">
+              <span className="w-36 shrink-0 text-neutral-400">{AREA_LABELS[area]}</span>
+              <div className="h-2 flex-1 rounded bg-neutral-800">
+                <div className={`h-2 rounded ${count ? "bg-sky-500" : ""}`} style={{ width: `${(count / maxCount) * 100}%` }} />
+              </div>
+              <span className={`w-6 text-right font-mono text-xs ${count ? "" : "text-amber-400"}`}>{count}</span>
+            </div>
+          ))}
+        </div>
+        <div className="space-y-3 text-sm">
+          <p className="text-neutral-400">
+            Pomiary z progami w bazie: <b className="text-neutral-200">{metricsWithRules.size}</b> / {METRIC_KEYS.length}. Pomiar z
+            progami jest oceniany przez kod - najbardziej powtarzalnie.
+          </p>
+          <div className="flex flex-wrap gap-1.5">
+            {METRIC_KEYS.map((k) => (
+              <span
+                key={k}
+                title={METRIC_INFO[k].description}
+                className={`rounded px-1.5 py-0.5 text-xs ${metricsWithRules.has(k) ? "bg-emerald-500/15 text-emerald-300" : "bg-neutral-800 text-neutral-500"}`}
+              >
+                {METRIC_INFO[k].label}
+              </span>
+            ))}
+          </div>
+          {noCriteria > 0 && <p className="text-amber-300/90">{noCriteria} wpisów nie ma kryteriów oceny - model oceni je tylko na podstawie samej zasady.</p>}
+          {noRecs > 0 && <p className="text-amber-300/90">{noRecs} wpisów nie ma zaleceń - przy słabym wyniku raport nie podpowie, co zmienić.</p>}
+        </div>
+      </div>
+    </section>
   );
 }
 

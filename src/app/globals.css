@@ -9,3 +9,16 @@ body {
   color: #ededed;
   font-family: var(--font-geist-sans), system-ui, sans-serif;
 }
+
+@media print {
+  :root {
+    color-scheme: light;
+  }
+  body {
+    background: #fff;
+    color: #111;
+  }
+  details > summary {
+    list-style: none;
+  }
+}

@@ -7,24 +7,39 @@ import { METRIC_KEYS } from "@/lib/metrics";
 export const runtime = "nodejs";
 export const maxDuration = 300;
 
+const DATA_URL = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/;
+const MAX_IMAGE_CHARS = 7_000_000;
+
+const ImageSchema = z
+  .string()
+  .max(MAX_IMAGE_CHARS, "Zdjęcie jest za duże.")
+  .regex(DATA_URL, "Niepoprawny format zdjęcia.")
+  .transform((s) => {
+    const [, mediaType, data] = s.match(DATA_URL)!;
+    return { mediaType: mediaType as "image/jpeg" | "image/png" | "image/webp", data };
+  });
+
 const RequestSchema = z.object({
-  image: z.string().regex(/^data:image\/(jpeg|png|webp);base64,/),
-  metrics: z.partialRecord(z.enum(METRIC_KEYS), z.number()),
-  warnings: z.array(z.string()).max(10),
+  frontImage: ImageSchema,
+  profileImage: ImageSchema.optional(),
+  metrics: z.partialRecord(z.enum(METRIC_KEYS), z.number().finite()),
+  spreads: z.partialRecord(z.enum(METRIC_KEYS), z.number().finite().nonnegative()),
+  samples: z.number().int().min(1).max(50),
+  qualityNotes: z.array(z.string().max(300)).max(20),
   consent: z.literal(true),
 });
 
-// Zdjęcie jest przetwarzane tylko w pamięci na potrzeby tej analizy - nie zapisujemy go.
+// Zdjęcia są przetwarzane tylko w pamięci na potrzeby tej analizy - nie zapisujemy ich.
 export async function POST(req: Request) {
   try {
     const body = RequestSchema.parse(await req.json());
-    const [, mediaType, data] = body.image.match(/^data:(image\/(?:jpeg|png|webp));base64,(.*)$/s)!;
-    if (data.length > 7_000_000) return NextResponse.json({ error: "Zdjęcie jest za duże." }, { status: 400 });
     const result = await analyzeFace({
-      imageBase64: data,
-      mediaType: mediaType as "image/jpeg" | "image/png" | "image/webp",
+      front: body.frontImage,
+      profile: body.profileImage,
       metrics: body.metrics,
-      warnings: body.warnings,
+      spreads: body.spreads,
+      samples: body.samples,
+      qualityNotes: body.qualityNotes,
     });
     return NextResponse.json(result);
   } catch (err) {

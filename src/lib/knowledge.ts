@@ -3,7 +3,7 @@ import { UserError } from "./http";
 import type Anthropic from "@anthropic-ai/sdk";
 import { structuredCall } from "./claude";
 import { METRIC_INFO, METRIC_KEYS } from "./metrics";
-import { AREAS, AREA_LABELS, ConsolidationSchema, ExtractionSchema, type DraftEntry, type KnowledgeEntry } from "./schema";
+import { AREAS, AREA_LABELS, ConsolidationSchema, ExtractionSchema, type ConsolidationProposal, type DraftEntry, type KnowledgeEntry } from "./schema";
 import { backupDb, newEntry, newId, readDb, updateDb } from "./store";
 
 const METRIC_GUIDE = METRIC_KEYS.map((k) => `- ${k}: ${METRIC_INFO[k].label} - ${METRIC_INFO[k].description}`).join("\n");
@@ -127,28 +127,99 @@ export function entriesForPrompt(entries: KnowledgeEntry[]) {
   );
 }
 
-export async function consolidate() {
-  const before = await readDb();
-  if (before.entries.length === 0) throw new UserError("Baza jest pusta.", 409);
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
 
-  const result = await structuredCall({
-    schema: ConsolidationSchema,
-    system: [{ type: "text", text: CONSOLIDATION_SYSTEM }],
-    content: [{ type: "text", text: `<baza_wiedzy>\n${entriesForPrompt(before.entries)}\n</baza_wiedzy>\n\nUporządkuj tę bazę.` }],
-    effort: "high",
+/**
+ * Przygotowuje propozycję uporządkowania bazy (nic jeszcze nie zmienia).
+ * Każdy obszar jest porządkowany osobnym zapytaniem - działa też dla bardzo dużych baz.
+ */
+export async function proposeConsolidation(): Promise<ConsolidationProposal> {
+  const db = await readDb();
+  if (db.entries.length === 0) throw new UserError("Baza jest pusta.", 409);
+
+  const groups = AREAS.map((area) => db.entries.filter((e) => e.area === area)).filter((g) => g.length > 0);
+  const results = await mapLimit(groups, 3, async (group) => {
+    // Pojedynczy wpis nie ma z czym się łączyć.
+    if (group.length === 1) {
+      const { id, sourceIds, updatedAt, ...draft } = group[0];
+      return { entries: [{ ...draft, mergedFrom: [id] }], changes: [] as string[] };
+    }
+    return structuredCall({
+      schema: ConsolidationSchema,
+      system: [{ type: "text", text: CONSOLIDATION_SYSTEM }],
+      content: [
+        {
+          type: "text",
+          text: `<baza_wiedzy obszar="${AREA_LABELS[group[0].area]}">\n${entriesForPrompt(group)}\n</baza_wiedzy>\n\nUporządkuj wpisy z tego obszaru.`,
+        },
+      ],
+      effort: "high",
+      maxTokens: 128000,
+    });
   });
 
+  const known = new Set(db.entries.map((e) => e.id));
+  const proposal: ConsolidationProposal = {
+    createdAt: new Date().toISOString(),
+    basedOn: [...known],
+    entries: results.flatMap((r) => r.entries.map((e) => ({ ...e, mergedFrom: e.mergedFrom.filter((id) => known.has(id)) }))),
+    changes: results.flatMap((r) => r.changes),
+  };
+  await updateDb((d) => {
+    d.pendingConsolidation = proposal;
+  });
+  return proposal;
+}
+
+export async function applyConsolidation() {
   await backupDb("przed-porzadkowaniem");
   return updateDb((db) => {
+    const proposal = db.pendingConsolidation;
+    if (!proposal) throw new UserError("Brak propozycji do zatwierdzenia.", 409);
     const byId = new Map(db.entries.map((e) => [e.id, e]));
-    const merged = result.entries.map(({ mergedFrom, ...draft }) => {
+    const merged = proposal.entries.map(({ mergedFrom, ...draft }) => {
       const sourceIds = [...new Set(mergedFrom.flatMap((id) => byId.get(id)?.sourceIds ?? []))];
       return newEntry(db, draft, sourceIds);
     });
-    // Wpisy dodane w trakcie porządkowania (równoległy upload) nie mogą zniknąć.
-    const seen = new Set(before.entries.map((e) => e.id));
-    const addedMeanwhile = db.entries.filter((e) => !seen.has(e.id));
+    // Wpisy dodane po przygotowaniu propozycji nie mogą zniknąć.
+    const basedOn = new Set(proposal.basedOn);
+    const addedMeanwhile = db.entries.filter((e) => !basedOn.has(e.id));
+    const before = db.entries.length;
     db.entries = [...merged, ...addedMeanwhile];
-    return { before: before.entries.length, after: db.entries.length, changes: result.changes };
+    db.pendingConsolidation = null;
+    return { before, after: db.entries.length };
+  });
+}
+
+export async function rejectConsolidation() {
+  await updateDb((db) => {
+    db.pendingConsolidation = null;
+  });
+}
+
+/** Usuwa materiał i wpisy, które pochodziły tylko z niego. */
+export async function deleteSource(sourceId: string) {
+  await backupDb("przed-usunieciem-materialu");
+  return updateDb((db) => {
+    const before = db.entries.length;
+    db.entries = db.entries.flatMap((e) => {
+      if (!e.sourceIds.includes(sourceId)) return [e];
+      const rest = e.sourceIds.filter((s) => s !== sourceId);
+      // Wpis znika tylko wtedy, gdy ten materiał był jego jedynym źródłem.
+      return rest.length > 0 ? [{ ...e, sourceIds: rest }] : [];
+    });
+    db.sources = db.sources.filter((s) => s.id !== sourceId);
+    return { removedEntries: before - db.entries.length };
   });
 }

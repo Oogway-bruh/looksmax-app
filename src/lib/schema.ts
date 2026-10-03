@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { METRIC_KEYS } from "./metrics";
+import { METRIC_KEYS, type MetricKey } from "./metrics";
 
 export const AREAS = [
   "eyes",
@@ -88,10 +88,19 @@ export type KnowledgeSource = {
   notes: string;
 };
 
+export type ConsolidationProposal = {
+  createdAt: string;
+  /** ID wpisów, które istniały w chwili tworzenia propozycji */
+  basedOn: string[];
+  entries: (DraftEntry & { mergedFrom: string[] })[];
+  changes: string[];
+};
+
 export type Database = {
   entries: KnowledgeEntry[];
   sources: KnowledgeSource[];
   nextEntryNumber: number;
+  pendingConsolidation?: ConsolidationProposal | null;
 };
 
 export const ExtractionSchema = z.object({
@@ -108,52 +117,80 @@ export const ConsolidationSchema = z.object({
   changes: z.array(z.string()).describe("Lista najważniejszych zmian: co połączono, co usunięto i dlaczego"),
 });
 
+export const CONFIDENCE = ["low", "medium", "high"] as const;
+export type Confidence = (typeof CONFIDENCE)[number];
+
+// To, co zwraca Claude: ocena KAŻDEGO wpisu bazy osobno. Liczby końcowe i kolejność liczy kod.
 export const AnalysisSchema = z.object({
   photoQuality: z.object({
     ok: z.boolean(),
-    issues: z.array(z.string()),
+    issues: z.array(z.string()).describe("Problemy ze zdjęciem, które obniżają pewność oceny"),
   }),
-  summary: z.string().describe("Podsumowanie 2-4 zdania"),
-  areas: z.array(
-    z.object({
-      area: z.enum(AREAS),
-      observation: z.string().describe("Co widać na zdjęciu / w pomiarach w odniesieniu do kryteriów z bazy"),
-      score: z.number().nullable().describe("Ocena 1-10 wg kryteriów z bazy; null jeśli baza nie daje kryteriów oceny"),
-      entryIds: z.array(z.string()).describe("ID wpisów z bazy, na których opiera się ocena"),
-      strengths: z.array(z.string()),
-      improvements: z.array(
-        z.object({
-          text: z.string(),
-          entryIds: z.array(z.string()),
-          priority: z.enum(["high", "medium", "low"]),
-        }),
-      ),
-    }),
-  ),
-  topPriorities: z
-    .array(z.object({ text: z.string(), entryIds: z.array(z.string()) }))
-    .describe("3-5 najważniejszych zmian, od najważniejszej"),
-  notCoveredByKnowledge: z
-    .array(z.string())
-    .describe("Cechy widoczne na zdjęciu, których baza wiedzy nie obejmuje - bez oceniania ich"),
+  summary: z.string().describe("Podsumowanie 2-4 zdania: najmocniejsze strony i najważniejsze obszary do poprawy wg bazy"),
+  assessments: z
+    .array(
+      z.object({
+        entryId: z.string(),
+        status: z
+          .enum(["assessed", "advice", "not_visible"])
+          .describe("assessed = oceniono cechę; advice = ogólne zalecenie z bazy pasujące do tej osoby, bez oceny; not_visible = nie da się ocenić ze zdjęć"),
+        observation: z.string().describe("1-2 zdania: co widać, odniesione do kryteriów wpisu"),
+        verdict: z.enum(VERDICTS),
+        score: z.number().describe("1-10 wg kryteriów wpisu (dla advice/not_visible: 0)"),
+        confidence: z.enum(CONFIDENCE),
+        recommendationIndexes: z.array(z.number()).describe("Numery zaleceń z wpisu [0, 1, ...], które dotyczą tej osoby"),
+        personalNote: z.string().describe("Krótko, jak zastosować zalecenia wpisu u tej osoby - tylko na podstawie wpisu. Pusty string, jeśli nic"),
+      }),
+    )
+    .describe("Dokładnie jeden element dla każdego wpisu bazy, w kolejności wpisów"),
+  notCoveredByKnowledge: z.array(z.string()).describe("Cechy widoczne na zdjęciu, których baza nie obejmuje - bez oceniania ich"),
 });
 
 export type Analysis = z.infer<typeof AnalysisSchema>;
+export type AssessmentStatus = Analysis["assessments"][number]["status"];
 
 export type RuleResult = {
   entryId: string;
   title: string;
-  metric: string;
+  metric: MetricKey;
   value: number;
   verdict: (typeof VERDICTS)[number];
   score: number;
   note: string;
+  /** Wartość z niepewnością pomiaru przecina granicę przedziału */
+  borderline: boolean;
 };
 
+export type AssessedEntry = {
+  entryId: string;
+  title: string;
+  area: Area;
+  priority: number;
+  status: AssessmentStatus;
+  observation: string;
+  verdict: (typeof VERDICTS)[number] | null;
+  score: number | null;
+  confidence: Confidence;
+  /** Zalecenia dosłownie z bazy */
+  recommendations: string[];
+  personalNote: string;
+  rule: RuleResult | null;
+  /** Wpływ na wygląd = priorytet × (10 - ocena) × pewność */
+  impact: number;
+};
+
+export type AreaResult = { area: Area; score: number | null; entries: AssessedEntry[] };
+
 export type AnalysisResponse = {
-  analysis: Analysis;
-  ruleResults: RuleResult[];
+  summary: string;
+  photoQuality: Analysis["photoQuality"];
   overallScore: number | null;
-  droppedUnsupported: number;
-  entries: Pick<KnowledgeEntry, "id" | "title" | "area">[];
+  areas: AreaResult[];
+  priorities: AssessedEntry[];
+  strengths: AssessedEntry[];
+  advice: AssessedEntry[];
+  notVisible: AssessedEntry[];
+  notCovered: string[];
+  coverage: { totalEntries: number; assessed: number; ruleBased: number };
+  createdAt: string;
 };

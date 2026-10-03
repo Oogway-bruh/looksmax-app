@@ -5,23 +5,40 @@ bazie wiedzy**, a nie na ogólnie przyjętych kanonach czy wiedzy z internetu.
 
 ## Jak to działa
 
-1. **Pomiary (przeglądarka, bez AI).** MediaPipe Face Landmarker wykrywa 478 punktów twarzy, a kod liczy
-   16 pomiarów: nachylenie oczu, FWHR, midface ratio, ESR, proporcje nosa, ust, tercji i żuchwy, indeks asymetrii
-   ([`src/lib/metrics.ts`](src/lib/metrics.ts)).
-2. **Silnik reguł (serwer, bez AI).** Wpisy z bazy, które mają przypisany pomiar i progi, są oceniane przez kod -
-   deterministycznie i tylko według Twoich progów ([`src/lib/rules.ts`](src/lib/rules.ts)).
-3. **Claude (serwer).** Dostaje zdjęcie, pomiary, wyniki reguł i całą bazę wiedzy. Ma zakaz używania wiedzy spoza
-   bazy i każde zalecenie musi podpisać ID wpisu (np. `K012`). Kod odrzuca każde zalecenie bez pokrycia w
-   istniejących wpisach ([`src/lib/analyze.ts`](src/lib/analyze.ts)).
+### 1. Skanowanie (przeglądarka, bez AI)
+- **Kamera z prowadzeniem** (zalecane): na żywo sprawdza pozę głowy, mimikę, kierunek wzroku, światło, ostrość
+  i rozdzielczość. Zdjęcia robią się same, gdy warunki są spełnione; zbiera 6 klatek.
+- **Zdjęcia z galerii**: 1-5 zdjęć przodu, każde z oceną jakości; zdjęcia nieużyteczne (np. z uśmiechem) są
+  domyślnie pomijane. Opcjonalnie zdjęcie profilu.
+- MediaPipe Face Landmarker wykrywa 478 punktów; [`src/lib/metrics.ts`](src/lib/metrics.ts) liczy 21 pomiarów
+  (nachylenie oczu, FWHR, midface ratio, ESR, brwi, nos, usta, tercje, żuchwa, kąt brody, asymetria).
+- Dokładność: korekta obrotu głowy w 3D (z macierzy transformacji), każde ujęcie skanowane dwa razy (z odbiciem
+  lustrzanym) i uśrednione, a z wielu ujęć brana jest mediana z rozrzutem (±).
+- Mimika z blendshapes (uśmiech, otwarte usta, zamknięte oczy, uniesione brwi) - bo zmienia proporcje.
+
+### 2. Ocena (serwer)
+- **Silnik reguł** ([`src/lib/rules.ts`](src/lib/rules.ts)): wpisy z bazy z przypisanym pomiarem i progami są
+  oceniane przez kod; wynik na granicy przedziału (w granicach niepewności) dostaje niższą pewność.
+- **Claude** ocenia każdy wpis bazy osobno (oceniono / ogólne zalecenie / niewidoczne), wskazuje, które zalecenia
+  z wpisu dotyczą osoby, i nie może używać wiedzy spoza bazy ([`src/lib/analyze.ts`](src/lib/analyze.ts)).
+- **Raport liczy kod** ([`src/lib/scoring.ts`](src/lib/scoring.ts)): oceny obszarów i ogólna to średnie ważone
+  priorytetem wpisów i pewnością; priorytety zmian wg wpływu = priorytet × (10 - ocena) × pewność; zalecenia
+  są pokazywane dosłownie z bazy. Oceny wpisów spoza bazy są odrzucane.
+
+### 3. Raport i historia
+Wynik ogólny, najważniejsze zmiany, obszary ze szczegółami, mocne strony, zalecenia ogólne i pomiary.
+Zapis do PDF (drukowanie). Historia analiz w przeglądarce z porównaniem dwóch analiz (oceny i pomiary).
 
 ## Baza wiedzy (`/admin`)
 
-- **Wgrywanie materiałów:** .txt / .md, zdjęcia notatek/grafik, PDF. Claude czyta każdy plik i zamienia go na
-  uporządkowane wpisy (obszar, zasada, kryteria oceny, opcjonalnie progi liczbowe, zalecenia, priorytet 1-5),
-  bez dodawania czegokolwiek od siebie.
-- **Porządkowanie:** przycisk „Uporządkuj bazę” łączy duplikaty z różnych materiałów, oznacza sprzeczności
-  (nie rozstrzyga ich za Ciebie) i ustawia priorytety. Przed każdą zmianą kopia bazy trafia do `data/backups/`.
-- **Ręczna edycja** każdego wpisu, w tym progów dla pomiarów, oraz eksport/import całej bazy jako JSON.
+- **Wgrywanie materiałów:** .txt / .md, zdjęcia notatek/grafik, PDF - wiele naraz. Claude zamienia każdy plik
+  na wpisy (obszar, zasada, kryteria oceny, opcjonalnie progi liczbowe, zalecenia, priorytet 1-5), bez dodawania
+  czegokolwiek od siebie.
+- **Porządkowanie:** łączy duplikaty (osobno w każdym obszarze, więc działa przy dużych bazach), oznacza
+  sprzeczności i ustawia priorytety. Najpierw pokazuje **propozycję** (co połączono, co zostanie usunięte) -
+  baza zmienia się dopiero po zatwierdzeniu; kopia trafia do `data/backups/`.
+- **Pokrycie bazy:** ile wpisów ma każdy obszar, które pomiary mają progi, którym wpisom brakuje kryteriów lub zaleceń.
+- Ręczna edycja wpisów (w tym progów), usuwanie materiałów, eksport/import JSON.
 
 Baza jest przechowywana w pliku `data/db.json` (poza gitem).
 
@@ -35,6 +52,16 @@ npm run dev
 
 - http://localhost:3000 - analiza zdjęcia
 - http://localhost:3000/admin - baza wiedzy (hasło z `ADMIN_PASSWORD`; w trybie dev bez hasła)
+
+Kamera wymaga HTTPS (lub localhost).
+
+## Testy
+
+```bash
+npm test          # pomiary (na prawdziwych danych MediaPipe), jakość zdjęć, reguły i scoring
+npm run typecheck
+npm run lint
+```
 
 ## Prywatność
 
