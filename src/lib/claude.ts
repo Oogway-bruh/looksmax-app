@@ -1,17 +1,17 @@
 import "server-only";
 import Anthropic, { toFile } from "@anthropic-ai/sdk";
 import { z } from "zod";
+import { ClaudeRefusalError, ClaudeTruncatedError, UserError } from "./errors";
 
 export const MODEL = process.env.CLAUDE_MODEL ?? "claude-opus-5-5";
 
 const client = new Anthropic();
 
-export class ClaudeRefusalError extends Error {}
-export class ClaudeTruncatedError extends Error {}
+export { ClaudeRefusalError, ClaudeTruncatedError } from "./errors";
 
 function requireKey() {
   if (!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
-    throw new Error("Brak klucza API Anthropic - ustaw ANTHROPIC_API_KEY w pliku .env.local i uruchom aplikację ponownie.");
+    throw new UserError("Brak klucza API Anthropic - ustaw ANTHROPIC_API_KEY w pliku .env.local i uruchom aplikację ponownie.", 503);
   }
 }
 
@@ -32,17 +32,33 @@ export async function deleteFromFilesApi(fileId: string) {
   }
 }
 
-/** Błąd zapytania o plik z Files API, którego już nie ma (np. zmiana klucza API na inny workspace). */
-export function isMissingFileError(err: unknown): boolean {
-  return (
-    (err instanceof Anthropic.NotFoundError || err instanceof Anthropic.BadRequestError) && /file/i.test(err.message) && /not found|does not exist|invalid/i.test(err.message)
-  );
+/** Właściwy komunikat z treści odpowiedzi API (err.message SDK zawiera też status i całe JSON-y). */
+export function apiErrorMessage(err: unknown): string {
+  if (!(err instanceof Anthropic.APIError)) return "";
+  const body = err.error as { error?: { message?: unknown }; message?: unknown } | undefined;
+  const msg = body?.error?.message ?? body?.message;
+  return typeof msg === "string" ? msg : err.message;
 }
 
-/** Zapytanie odrzucone przez limity (za dużo obrazów/stron, za długi kontekst, za duże zapytanie). */
+/** Błąd zapytania o plik z Files API, którego już nie ma (np. zmiana klucza API na inny workspace). */
+export function isMissingFileError(err: unknown): boolean {
+  if (!(err instanceof Anthropic.NotFoundError || err instanceof Anthropic.BadRequestError)) return false;
+  const msg = apiErrorMessage(err);
+  return /\bfile/i.test(msg) && /not found|does not exist|no such|was deleted|has expired|expired/i.test(msg);
+}
+
+/**
+ * Zapytanie odrzucone, bo jest za duże: za długi kontekst, za dużo obrazów/stron/dokumentów, za duży rozmiar.
+ * Nie łapie innych błędów 400 (np. limity wydatków, nieprawidłowe max_tokens) - te mają dotrzeć do użytkownika.
+ */
 export function isRequestLimitError(err: unknown): boolean {
   if (err instanceof Anthropic.APIError && err.status === 413) return true;
-  return err instanceof Anthropic.BadRequestError && /too long|too many|exceed|maximum|limit|pages|images/i.test(err.message);
+  if (!(err instanceof Anthropic.BadRequestError)) return false;
+  const msg = apiErrorMessage(err);
+  if (/max_tokens|spend|credit|billing|balance|rate limit|quota/i.test(msg)) return false;
+  return /prompt is too long|input is too long|too many (images|pages|documents|files|media)|context (window|length)|request (is )?too large|exceeds? the (maximum|max|limit)|many-image|maximum (number|of) (\d+ )?(images|pages|documents)|pdf pages/i.test(
+    msg,
+  );
 }
 
 /** Dokładny rozmiar zapytania w tokenach (bez wysyłania go do modelu). */
@@ -107,4 +123,9 @@ export async function structuredCall<S extends z.ZodType>(opts: {
   } catch {
     throw new Error("Model nie zwrócił poprawnej odpowiedzi JSON.");
   }
+}
+
+/** Błąd po stronie zapytania (400/404/413) - np. problem z którymś z dołączonych plików. */
+export function isClientRequestError(err: unknown): boolean {
+  return err instanceof Anthropic.APIError && [400, 404, 413].includes(err.status ?? 0);
 }

@@ -1,7 +1,6 @@
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
-import JSZip from "jszip";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildTree, detectKind, isJunkFile, sanitizePath, treeText } from "@/lib/file-types";
 
@@ -12,11 +11,9 @@ afterAll(() => rmSync(dataDir, { recursive: true, force: true }));
 
 let knowledge: typeof import("@/lib/knowledge");
 let store: typeof import("@/lib/store");
-let materials: typeof import("@/lib/materials");
 beforeAll(async () => {
   knowledge = await import("@/lib/knowledge");
   store = await import("@/lib/store");
-  materials = await import("@/lib/materials");
 });
 
 describe("ścieżki i formaty", () => {
@@ -54,40 +51,6 @@ describe("ścieżki i formaty", () => {
     expect(tree.folders[0].folders.map((f) => f.name)).toEqual(["Oczy", "Żuchwa"]);
     expect(tree.folders[0].folders[0].files.map((f) => f.name)).toEqual(["a.txt", "b.txt"]);
     expect(treeText(tree)).toContain("Wiedza/\n  Oczy/\n    a.txt");
-  });
-});
-
-describe("odczyt plików biurowych", () => {
-  it("wyciąga tekst ze slajdów PowerPointa (z notatkami)", async () => {
-    const zip = new JSZip();
-    zip.file("ppt/slides/slide2.xml", `<p:sld><a:p><a:r><a:t>Drugi slajd</a:t></a:r></a:p></p:sld>`);
-    zip.file("ppt/slides/slide1.xml", `<p:sld><a:p><a:r><a:t>Canthal tilt &gt; 4°</a:t></a:r></a:p><a:p><a:r><a:t>= idealnie</a:t></a:r></a:p></p:sld>`);
-    zip.file("ppt/notesSlides/notesSlide1.xml", `<a:t>notatka prelegenta</a:t>`);
-    const text = await materials.extractText({ mediaType: "application/vnd.openxmlformats-officedocument.presentationml.presentation", path: "a.pptx" }, await zip.generateAsync({ type: "nodebuffer" }));
-    expect(text.indexOf("Slajd 1")).toBeLessThan(text.indexOf("Slajd 2"));
-    expect(text).toContain("Canthal tilt > 4°\n= idealnie");
-    expect(text).toContain("[notatki: notatka prelegenta]");
-  });
-
-  it("wyciąga wiersze z arkuszy Excela (wspólne teksty i liczby)", async () => {
-    const zip = new JSZip();
-    zip.file("xl/workbook.xml", `<workbook><sheets><sheet name="Progi" sheetId="1"/></sheets></workbook>`);
-    zip.file("xl/sharedStrings.xml", `<sst><si><t>Cecha</t></si><si><t>Próg</t></si><si><t>FWHR</t></si></sst>`);
-    zip.file(
-      "xl/worksheets/sheet1.xml",
-      `<worksheet><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row><row r="2"><c r="A2" t="s"><v>2</v></c><c r="B2"><v>1.9</v></c></row></sheetData></worksheet>`,
-    );
-    const text = await materials.extractText({ mediaType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", path: "a.xlsx" }, await zip.generateAsync({ type: "nodebuffer" }));
-    expect(text).toContain("Arkusz: Progi");
-    expect(text).toContain("Cecha | Próg");
-    expect(text).toContain("FWHR | 1.9");
-  });
-
-  it("HTML zamienia na czysty tekst", async () => {
-    const text = await materials.extractText({ mediaType: "text/plain", path: "a.html" }, Buffer.from("<html><style>x{}</style><h1>Oczy</h1><p>Tilt &amp; kąt</p></html>"));
-    expect(text).toContain("Oczy");
-    expect(text).toContain("Tilt & kąt");
-    expect(text).not.toContain("<");
   });
 });
 

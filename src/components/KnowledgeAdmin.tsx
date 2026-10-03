@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { MaterialsSection } from "./MaterialsSection";
+import { MaterialsSection, type SourceState } from "./MaterialsSection";
 import { METRIC_INFO, METRIC_KEYS, type MetricKey } from "@/lib/metrics";
 import { VERDICTS, VERDICT_LABELS, categoryName, type Category, type Database, type DraftEntry, type KnowledgeEntry, type SynthesisProposal } from "@/lib/schema";
 
@@ -31,6 +31,7 @@ const EMPTY_DRAFT: DraftEntry = { area: "", title: "", content: "", assessmentCr
 export function KnowledgeAdmin() {
   const [db, setDb] = useState<AdminData | null>(null);
   const [busy, setBusy] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [editing, setEditing] = useState<string | null>(null);
@@ -118,10 +119,17 @@ export function KnowledgeAdmin() {
   }
 
   const sourceName = new Map(db.sources.map((s) => [s.id, s.path]));
-  const analyzedIds = new Set(db.framework?.sourceIds ?? []);
-  const newSources = db.sources.filter((s) => !analyzedIds.has(s.id));
-  const removedSinceAnalysis = (db.framework?.sourceIds ?? []).filter((id) => !db.sources.some((s) => s.id === id)).length;
-  const materialsChanged = db.sources.length > 0 && (newSources.length > 0 || removedSinceAnalysis > 0);
+  // Stan materiału względem ostatniej analizy: nowy, zmieniony (inna treść niż przy analizie) albo aktualny.
+  const fw = db.framework;
+  const stateOf = (s: Database["sources"][number]): SourceState => {
+    if (!fw) return "new";
+    const analyzedHash = fw.sourceHashes?.[s.id];
+    if (analyzedHash !== undefined) return analyzedHash === s.hash ? "ok" : "changed";
+    return fw.sourceIds.includes(s.id) ? "ok" : "new";
+  };
+  const notAnalyzed = db.sources.filter((s) => stateOf(s) !== "ok").length;
+  const removedSinceAnalysis = (fw?.sourceIds ?? []).filter((id) => !db.sources.some((s) => s.id === id)).length;
+  const materialsChanged = db.sources.length > 0 && (notAnalyzed > 0 || removedSinceAnalysis > 0);
   const pending = db.pendingSynthesis;
 
   return (
@@ -139,7 +147,7 @@ export function KnowledgeAdmin() {
         </div>
       )}
 
-      <MaterialsSection sources={db.sources} analyzedIds={analyzedIds} disabled={busy || running} onChanged={reload} />
+      <MaterialsSection sources={db.sources} stateOf={stateOf} disabled={busy || running} onChanged={reload} onBusyChange={setUploading} />
 
       <section className={card}>
         <h2 className="text-lg font-semibold">2. Analiza materiałów</h2>
@@ -148,16 +156,26 @@ export function KnowledgeAdmin() {
           zalecenia, sprzeczności między materiałami oraz to, czego brakuje. Bez dodawania wiedzy spoza materiałów. Ręczne poprawki wpisów są zachowywane. Przy dużej
           ilości materiałów może to potrwać kilka-kilkanaście minut.
         </p>
+        {pending?.stale && !running && (
+          <p className="rounded-lg bg-amber-500/10 p-3 text-sm text-amber-200">
+            Materiały zmieniły się po przygotowaniu tej propozycji (pliki dodane, zmienione, przeniesione lub usunięte). Odrzuć ją i uruchom analizę ponownie, żeby
+            uwzględnić zmiany - albo zatwierdź, jeśli zmiany są nieistotne (wpisy z usuniętych plików zostaną pominięte).
+          </p>
+        )}
         {materialsChanged && !pending && !running && db.framework && (
-          <p className="rounded-lg bg-sky-500/10 p-3 text-sm text-sky-200">Materiały zmieniły się od ostatniej analizy - uruchom ją ponownie, żeby baza je uwzględniła.</p>
+          <p className="rounded-lg bg-sky-500/10 p-3 text-sm text-sky-200">
+            Materiały zmieniły się od ostatniej analizy ({notAnalyzed > 0 ? `${notAnalyzed} nowych lub zmienionych plików` : ""}
+            {notAnalyzed > 0 && removedSinceAnalysis > 0 ? ", " : ""}
+            {removedSinceAnalysis > 0 ? `${removedSinceAnalysis} usuniętych` : ""}) - uruchom analizę ponownie, żeby baza je uwzględniła.
+          </p>
         )}
         {!running && !pending && (
-          <button onClick={startSynthesis} disabled={busy || db.sources.length === 0 || !db.apiKeyConfigured} className={button}>
+          <button onClick={startSynthesis} disabled={busy || uploading || db.sources.length === 0 || !db.apiKeyConfigured} className={button}>
             Przeanalizuj wszystkie materiały ({db.sources.length})
           </button>
         )}
         {db.job && db.job.status !== "done" && <JobView job={db.job} />}
-        {pending && <ProposalView proposal={pending} db={db} busy={busy} onDecide={decide} />}
+        {pending && <ProposalView proposal={pending} db={db} busy={busy || uploading} onDecide={decide} />}
         {message && <pre className="whitespace-pre-wrap rounded-lg bg-neutral-800/60 p-3 text-sm text-neutral-300">{message}</pre>}
       </section>
 

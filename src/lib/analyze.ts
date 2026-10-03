@@ -1,11 +1,11 @@
 import "server-only";
 import type Anthropic from "@anthropic-ai/sdk";
-import { isMissingFileError, structuredCall } from "./claude";
-import { prepareMaterialsForAnalysis } from "./knowledge";
-import { UserError } from "./http";
+import { isClientRequestError, isMissingFileError, structuredCall } from "./claude";
+import { materialsReady, resetFileIds } from "./knowledge";
+import { UserError } from "./errors";
 import { METRIC_INFO, formatMetric, type MetricKey, type Metrics } from "./metrics";
 import { evaluateRules } from "./rules";
-import { allSourceBlocks } from "./materials";
+import { allItems } from "./materials";
 import {
   AnalysisSchema,
   VERDICT_LABELS,
@@ -13,6 +13,7 @@ import {
   type AnalysisResponse,
   type Category,
   type Database,
+  type KnowledgeSource,
   type KnowledgeEntry,
   type RuleResult,
 } from "./schema";
@@ -85,16 +86,27 @@ function frameworkText(db: Database) {
     .join("\n\n");
 }
 
-/** Czy dołączać pełne materiały: tylko gdy są przeanalizowane i mieszczą się w limicie. */
-function shouldIncludeMaterials(db: Database) {
-  if (db.sources.length === 0) return false;
-  const images = db.sources.filter((s) => s.kind === "image").length;
-  const pages = db.sources.reduce((n, s) => n + (s.kind === "pdf" ? (s.pages ?? 1) : 0), 0);
+/** Materiały, na których zbudowano obecny system oceny i które od tego czasu się nie zmieniły. */
+function analyzedSources(db: Database): KnowledgeSource[] {
+  const f = db.framework;
+  if (!f) return [];
+  if (f.sourceHashes) return db.sources.filter((s) => f.sourceHashes![s.id] === s.hash);
+  return db.sources.filter((s) => f.sourceIds.includes(s.id));
+}
+
+/**
+ * Czy dołączać pełne materiały: tylko przeanalizowane, mieszczące się w limitach i już przygotowane w Files API
+ * (wgrywanie plików nie może opóźniać analizy użytkownika - w razie potrzeby dzieje się w tle).
+ */
+function materialsToInclude(db: Database): KnowledgeSource[] {
+  const sources = analyzedSources(db);
+  if (sources.length === 0) return [];
+  const images = sources.reduce((n, s) => n + (s.parts?.length ?? 0), 0);
+  const pages = sources.reduce((n, s) => n + (s.kind === "pdf" ? (s.pages ?? 1) : 0), 0);
   // Limity API na zapytanie: 600 obrazów i 600 stron PDF (z zapasem na zdjęcia twarzy).
-  if (images > 300 || pages > 300) return false;
-  const tokens = db.framework?.materialTokens;
-  if (tokens != null) return tokens <= FULL_MATERIALS_LIMIT;
-  return db.sources.reduce((s, x) => s + x.size, 0) < 1_500_000;
+  if (images > 300 || pages > 300) return [];
+  if ((db.framework?.materialTokens ?? Infinity) > FULL_MATERIALS_LIMIT) return [];
+  return materialsReady(sources) ? sources : [];
 }
 
 function measurementsText(metrics: Metrics, spreads: Partial<Record<MetricKey, number>>, samples: number) {
@@ -130,14 +142,13 @@ export async function analyzeFace(input: {
 
   const rules = evaluateRules(db.entries, input.metrics, input.spreads);
 
-  const includeMaterials = shouldIncludeMaterials(db);
-  const run = async (forceReupload: boolean) => {
+  const materials = materialsToInclude(db);
+  const run = async (withMaterials: boolean) => {
     const content: Anthropic.Beta.BetaContentBlockParam[] = [];
-    if (includeMaterials) {
+    if (withMaterials) {
       // Obrazy i PDF-y przez Files API - zapytanie zostaje małe nawet przy wielu plikach.
-      await prepareMaterialsForAnalysis(forceReupload);
-      const materials = await allSourceBlocks((await readDb()).sources);
-      content.push({ type: "text", text: "<materialy_autora>" }, ...materials, { type: "text", text: "</materialy_autora>" });
+      const blocks = (await allItems(materials)).flatMap((i) => i.blocks);
+      content.push({ type: "text", text: "<materialy_autora>" }, ...blocks, { type: "text", text: "</materialy_autora>" });
       // Materiały są takie same dla każdej analizy - cache obniża koszt i czas kolejnych analiz.
       const last = content[content.length - 1] as Anthropic.Beta.BetaTextBlockParam;
       last.cache_control = { type: "ephemeral" };
@@ -182,14 +193,18 @@ export async function analyzeFace(input: {
     });
   };
 
+  let usedMaterials = materials.length > 0;
   let analysis;
   try {
-    analysis = await run(false);
+    analysis = await run(usedMaterials);
   } catch (err) {
-    // Pliki w Files API zniknęły (np. zmiana klucza API) - wgrywamy je ponownie i próbujemy raz jeszcze.
-    if (!includeMaterials || !isMissingFileError(err)) throw err;
-    analysis = await run(true);
+    // Problem z dołączonymi materiałami (np. plik usunięty z Files API) - analiza bez nich, wg samej bazy wiedzy.
+    if (!usedMaterials || !isClientRequestError(err)) throw err;
+    console.warn("Analiza z pełnymi materiałami nie powiodła się - ponawiam bez nich:", err);
+    if (isMissingFileError(err)) await resetFileIds(materials);
+    usedMaterials = false;
+    analysis = await run(false);
   }
 
-  return buildReport(db.entries, analysis, rules, db.categories, includeMaterials);
+  return buildReport(db.entries, analysis, rules, db.categories, usedMaterials);
 }

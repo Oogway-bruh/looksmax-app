@@ -70,6 +70,17 @@ export const KnowledgeEntrySchema = DraftEntrySchema.extend({
 
 export type KnowledgeEntry = z.infer<typeof KnowledgeEntrySchema>;
 
+/** Obraz gotowy do wysłania (część materiału): kawałek długiego zrzutu albo obraz osadzony w dokumencie. */
+export type SourcePart = {
+  storedAs: string;
+  mediaType: "image/png" | "image/jpeg";
+  width: number;
+  height: number;
+  label: string;
+  /** ID w Anthropic Files API (wgrywane raz, potem wskazywane w zapytaniach) */
+  fileId?: string | null;
+};
+
 export type KnowledgeSource = {
   id: string;
   /** Ścieżka względna z folderami, np. "Looksmax/Oczy/canthal.txt" (identyfikuje materiał) */
@@ -78,17 +89,21 @@ export type KnowledgeSource = {
   filename: string;
   kind: "text" | "image" | "pdf";
   mediaType: string;
-  /** Plik w data/sources */
+  /** Oryginalny plik w data/sources (do podglądu/pobrania) */
   storedAs: string;
   size: number;
-  /** SHA-256 treści - do wykrywania duplikatów i zmian */
+  /** SHA-256 zapisanych bajtów - zmiana = materiał wymaga ponownej analizy */
   hash: string;
-  /** Wymiary obrazu (do szacowania kosztu w tokenach) */
+  /** SHA-256 oryginalnego pliku z dysku autora (liczony w przeglądarce) - do pomijania niezmienionych plików przy ponownym wgraniu */
+  originalHash?: string;
+  /** Wymiary oryginalnego obrazu */
   width?: number;
   height?: number;
-  /** Przybliżona liczba stron PDF */
+  /** Liczba stron PDF */
   pages?: number;
-  /** ID pliku w Anthropic Files API (obrazy i PDF-y) - żeby nie wysyłać ich za każdym razem */
+  /** Obrazy do wysłania: znormalizowany obraz/kawałki albo obrazy osadzone w dokumencie */
+  parts?: SourcePart[];
+  /** PDF: ID w Anthropic Files API */
   fileId?: string | null;
   uploadedAt: string;
   /** Ile wpisów wskazuje ten materiał jako źródło (po ostatniej analizie) */
@@ -106,6 +121,8 @@ export type Framework = {
   materialTokens: number | null;
   analyzedAt: string;
   sourceIds: string[];
+  /** Skróty materiałów z chwili analizy - pozwalają wykryć pliki zmienione później */
+  sourceHashes?: Record<string, string>;
 };
 
 export const SynthesisSchema = z.object({
@@ -144,7 +161,11 @@ export type SynthesisProposal = {
   /** ID wpisów, które istniały w chwili tworzenia propozycji */
   basedOn: string[];
   sourceIds: string[];
+  /** Stan materiałów w chwili przygotowania propozycji */
+  sources?: { id: string; path: string; hash: string }[];
   synthesis: Synthesis;
+  /** Materiały zmieniły się po przygotowaniu propozycji (dodane/zmienione/usunięte/przeniesione) */
+  stale?: boolean;
 };
 
 export type Database = {

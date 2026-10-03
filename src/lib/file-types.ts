@@ -14,7 +14,7 @@ export const OFFICE = {
 } as const;
 
 export const ACCEPT_ATTR =
-  ".txt,.md,.markdown,.csv,.tsv,.json,.html,.htm,.rtf,.xml,.yaml,.yml,.srt,.vtt,.docx,.pptx,.xlsx,.pdf,.jpg,.jpeg,.png,.webp,.gif,.heic,.heif";
+  ".txt,.md,.markdown,.csv,.tsv,.json,.html,.htm,.rtf,.xml,.yaml,.yml,.srt,.vtt,.docx,.docm,.pptx,.pptm,.ppsx,.ppsm,.xlsx,.xlsm,.pdf,.jpg,.jpeg,.png,.webp,.gif,.tif,.tiff,.avif,.heic,.heif";
 
 export function extOf(name: string): string {
   const base = name.split("/").pop() ?? name;
@@ -30,10 +30,13 @@ export function detectKind(filename: string, mediaType = ""): { kind: SourceKind
   if (ext === ".png") return { kind: "image", mediaType: "image/png" };
   if (ext === ".webp") return { kind: "image", mediaType: "image/webp" };
   if (ext === ".gif") return { kind: "image", mediaType: "image/gif" };
+  // Pozostałe obrazy (TIFF, AVIF) - serwer zamienia je na PNG/JPG.
+  if ([".tif", ".tiff", ".avif"].includes(ext)) return { kind: "image", mediaType: ext === ".avif" ? "image/avif" : "image/tiff" };
   if (mediaType === "application/pdf" || ext === ".pdf") return { kind: "pdf", mediaType: "application/pdf" };
-  if (ext === ".docx") return { kind: "text", mediaType: OFFICE.docx };
-  if (ext === ".pptx") return { kind: "text", mediaType: OFFICE.pptx };
-  if (ext === ".xlsx") return { kind: "text", mediaType: OFFICE.xlsx };
+  // Warianty z makrami/pokazy mają tę samą budowę - czytamy je tak samo.
+  if (ext === ".docx" || ext === ".docm") return { kind: "text", mediaType: OFFICE.docx };
+  if ([".pptx", ".pptm", ".ppsx", ".ppsm"].includes(ext)) return { kind: "text", mediaType: OFFICE.pptx };
+  if (ext === ".xlsx" || ext === ".xlsm") return { kind: "text", mediaType: OFFICE.xlsx };
   if (TEXT_EXT.includes(ext)) return { kind: "text", mediaType: mediaType.startsWith("text/") ? mediaType : "text/plain" };
   if (mediaType.startsWith("text/")) return { kind: "text", mediaType };
   return null;
@@ -44,13 +47,16 @@ export function isHeic(name: string, type = ""): boolean {
   return /\.(heic|heif)$/i.test(name) || /image\/hei[cf]/i.test(type);
 }
 
-/** Pliki systemowe i tymczasowe, które pomijamy bez pytania (np. .DS_Store, Thumbs.db, ~$plik.docx). */
+/**
+ * Pliki systemowe i tymczasowe, które pomijamy bez pytania: ukryte pliki i foldery (.DS_Store, .obsidian, .Trashes),
+ * __MACOSX, Thumbs.db, desktop.ini, pliki blokad Office (~$plik.docx), ikonki folderów macOS ("Icon\r").
+ */
 export function isJunkFile(path: string): boolean {
   const parts = path.split("/");
   const name = parts[parts.length - 1] ?? "";
-  if (parts.some((p) => p === "__MACOSX" || p === ".git" || p === "node_modules")) return true;
-  if (name.startsWith(".") || name.startsWith("~$")) return true;
-  return ["thumbs.db", "desktop.ini", "icon\r"].includes(name.toLowerCase());
+  if (parts.some((p) => p.startsWith(".") || p === "__MACOSX" || p === "node_modules" || p === "$RECYCLE.BIN" || p === "System Volume Information")) return true;
+  if (name.startsWith("~$") || name === "Icon\r" || name === "Icon") return true;
+  return ["thumbs.db", "desktop.ini", "ehthumbs.db"].includes(name.toLowerCase());
 }
 
 /** Podpowiedź dla nieobsługiwanych formatów. */
@@ -65,17 +71,35 @@ export function unsupportedHint(name: string): string {
   return "nieobsługiwany format";
 }
 
+/** Krótki, stabilny skrót tekstu (FNV-1a) - do skracania długich nazw bez kolizji. */
+function shortHash(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 0x01000193);
+  return (h >>> 0).toString(36);
+}
+
+const MAX_SEGMENT = 150;
+
+/** Zbyt długą nazwę skracamy, zachowując rozszerzenie i dodając skrót całej nazwy (różne nazwy się nie zleją). */
+function shortenSegment(seg: string): string {
+  if (seg.length <= MAX_SEGMENT) return seg;
+  const dot = seg.lastIndexOf(".");
+  const ext = dot > 0 && seg.length - dot <= 10 ? seg.slice(dot) : "";
+  return `${seg.slice(0, MAX_SEGMENT - ext.length - 9)}~${shortHash(seg).padStart(7, "0").slice(0, 7)}${ext}`;
+}
+
 /**
- * Bezpieczna ścieżka względna "Folder/Podfolder/plik.ext": bez "..", ukośników na początku,
- * znaków sterujących i zbyt długich fragmentów.
+ * Bezpieczna ścieżka względna "Folder/Podfolder/plik.ext": bez "..", ukośników na początku i znaków sterujących.
+ * Unicode w postaci NFC - ten sam folder z macOS (NFD) i z Windows daje tę samą ścieżkę.
  */
 export function sanitizePath(raw: string): string {
   const parts = raw
+    .normalize("NFC")
     .replace(/\\/g, "/")
     .split("/")
-    .map((p) => p.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 120))
+    .map((p) => shortenSegment(p.replace(/[\u0000-\u001f\u007f]/g, "").trim()))
     .filter((p) => p && p !== "." && p !== "..");
-  return parts.join("/").slice(0, 500) || "plik";
+  return parts.join("/") || "plik";
 }
 
 export function basename(path: string): string {

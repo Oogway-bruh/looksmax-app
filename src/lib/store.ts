@@ -62,11 +62,16 @@ export function updateDb<T>(fn: (db: Database) => T | Promise<T>): Promise<T> {
   return run;
 }
 
+const MAX_BACKUPS = 40;
+
+/** Kopia bazy przed większą zmianą; trzymamy tylko ostatnie kopie, żeby nie zapełnić dysku. */
 export async function backupDb(reason: string) {
   const db = await readDb();
   await fs.mkdir(BACKUP_DIR, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   await fs.writeFile(path.join(BACKUP_DIR, `${stamp}-${reason}.json`), JSON.stringify(db, null, 2));
+  const files = (await fs.readdir(BACKUP_DIR)).filter((f) => f.endsWith(".json")).sort();
+  for (const old of files.slice(0, Math.max(0, files.length - MAX_BACKUPS))) await fs.rm(path.join(BACKUP_DIR, old), { force: true });
 }
 
 export function newEntry(db: Database, draft: DraftEntry, sourceIds: string[], manual = false): KnowledgeEntry {
