@@ -8,6 +8,7 @@ export function LoginForm() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [ok, setOk] = useState(false);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -19,11 +20,12 @@ export function LoginForm() {
       body: JSON.stringify({ password }),
     });
     const json = await res.json().catch(() => ({}));
-    setBusy(false);
     if (!res.ok) {
+      setBusy(false);
       setError(json.error ?? "Nie udało się zalogować.");
       return;
     }
+    setOk(true);
     const next = params.get("next");
     // Pełne przeładowanie: router Next.js mógł zapamiętać przekierowanie do logowania sprzed zalogowania.
     window.location.assign(next && next.startsWith("/") && !next.startsWith("//") ? next : "/admin");
@@ -41,8 +43,17 @@ export function LoginForm() {
         className="w-full rounded-lg border border-neutral-700 bg-neutral-900 px-3 py-2"
       />
       {error && <p className="rounded-lg bg-red-500/10 p-3 text-sm text-red-300">{error}</p>}
+      {ok && (
+        <p className="rounded-lg bg-emerald-500/10 p-3 text-sm text-emerald-300">
+          Zalogowano - otwieram panel… Jeśli nic się nie dzieje,{" "}
+          <a href="/admin" className="underline">
+            kliknij tutaj
+          </a>
+          .
+        </p>
+      )}
       <button disabled={busy || !password} className="w-full rounded-lg bg-sky-500 px-4 py-2 font-semibold text-neutral-950 disabled:opacity-50">
-        {busy ? "Logowanie…" : "Zaloguj"}
+        {ok ? "Zalogowano" : busy ? "Logowanie…" : "Zaloguj"}
       </button>
     </form>
   );

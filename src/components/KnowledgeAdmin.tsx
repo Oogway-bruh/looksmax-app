@@ -11,11 +11,13 @@ type UploadStatus = { name: string; state: "waiting" | "working" | "done" | "err
 const UPLOAD_CONCURRENCY = 3;
 const ACCEPT = ".txt,.md,.csv,.json,.docx,.pdf,.jpg,.jpeg,.png,.webp,text/*,image/jpeg,image/png,image/webp,application/pdf";
 
+class SessionError extends Error {}
+
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
   if (res.status === 401) {
-    window.location.href = "/login?next=/admin";
-    throw new Error("Sesja wygasła - zaloguj się ponownie.");
+    // Bez automatycznego przekierowania (unikamy pętli) - komunikat z linkiem do logowania.
+    throw new SessionError("Sesja wygasła lub ciasteczko logowania nie dotarło do serwera - zaloguj się ponownie.");
   }
   const json = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(json.error ?? `Błąd ${res.status}`);
@@ -158,7 +160,18 @@ export function KnowledgeAdmin() {
       .filter((g) => g.entries.length > 0);
   }, [db, filter]);
 
-  if (!db) return <p className="text-neutral-400">Wczytywanie…</p>;
+  if (!db) {
+    return message ? (
+      <p className="rounded-lg bg-red-500/10 p-4 text-sm text-red-300">
+        {message}{" "}
+        <a href="/login?next=/admin" className="underline">
+          Przejdź do logowania
+        </a>
+      </p>
+    ) : (
+      <p className="text-neutral-400">Wczytywanie…</p>
+    );
+  }
 
   const sourceName = new Map(db.sources.map((s) => [s.id, s.filename]));
   const analyzedIds = new Set(db.framework?.sourceIds ?? []);
