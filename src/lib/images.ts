@@ -11,6 +11,7 @@ export const MAX_SIDE = 2000;
 const MAX_PART_BYTES = 4.5 * 1024 * 1024;
 const TILE_OVERLAP = 120;
 const MAX_TILES = 12;
+const MAX_TIFF_PAGES = 50;
 
 export type ImagePart = { data: Buffer; mediaType: "image/png" | "image/jpeg"; width: number; height: number };
 
@@ -21,20 +22,33 @@ export type ImagePart = { data: Buffer; mediaType: "image/png" | "image/jpeg"; w
  * - długie zrzuty ekranu (np. przewijane czaty, artykuły): pocięcie na czytelne kawałki ≤ 2000 px
  *   z małą zakładką, zamiast zmniejszania tekstu do nieczytelności.
  */
-export async function normalizeImage(input: Buffer, opts: { minSide?: number } = {}): Promise<{ parts: ImagePart[]; width: number; height: number; format: string }> {
+export async function normalizeImage(
+  input: Buffer,
+  opts: { minSide?: number; page?: number } = {},
+): Promise<{ parts: ImagePart[]; width: number; height: number; format: string }> {
+  const source = { animated: false, page: opts.page ?? 0 };
   let meta: Metadata;
   try {
-    meta = await sharp(input, { animated: false }).metadata();
+    meta = await sharp(input, source).metadata();
   } catch {
     throw new UserError("nie udało się odczytać obrazu (uszkodzony lub nieobsługiwany format - zapisz jako JPG lub PNG)");
   }
   if (!meta.width || !meta.height) throw new UserError("nie udało się odczytać wymiarów obrazu");
+
+  // Wielostronicowy TIFF (skany, faksy): wszystkie strony po kolei, nie tylko pierwsza.
+  const pages = meta.format === "tiff" ? (meta.pages ?? 1) : 1;
+  if (pages > 1 && opts.page === undefined) {
+    if (pages > MAX_TIFF_PAGES) throw new UserError(`plik TIFF ma ${pages} stron - zapisz go jako PDF (obsługujemy do ${MAX_TIFF_PAGES} stron w TIFF)`);
+    const parts: ImagePart[] = [];
+    for (let page = 0; page < pages; page++) parts.push(...(await normalizeImage(input, { ...opts, page })).parts);
+    return { parts, width: meta.width, height: meta.height, format: "tiff" };
+  }
   if (opts.minSide && Math.max(meta.width, meta.height) < opts.minSide) return { parts: [], width: meta.width, height: meta.height, format: meta.format ?? "" };
 
   // Zrzuty i grafiki (PNG/GIF) zostają bezstratne; zdjęcia jako JPG.
   const lossless = meta.format === "png" || meta.format === "gif";
   // Obraz po obróceniu wg EXIF, z białym tłem zamiast przezroczystości.
-  const { data: oriented, info } = await sharp(input, { animated: false })
+  const { data: oriented, info } = await sharp(input, source)
     .rotate()
     .flatten({ background: "#ffffff" })
     .toColourspace("srgb")

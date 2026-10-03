@@ -114,9 +114,10 @@ export function MaterialsSection({
       );
 
       // 2) Co już jest na serwerze.
+      const roots = opts.folderMode ? uploadRoots(accepted) : [];
       const known = accepted.map((f, i) => ({ path: f.path, hash: hashes[i] })).filter((f): f is { path: string; hash: string } => Boolean(f.hash));
       let check = { unchanged: [] as string[], duplicates: [] as { path: string; of: string }[], moves: [] as { from: string; to: string }[] };
-      if (known.length) check = await postJson("/api/knowledge/sources/check", { files: known });
+      if (known.length) check = await postJson("/api/knowledge/sources/check", { files: known, roots });
       const skip = new Set([...check.unchanged, ...check.duplicates.map((d) => d.path), ...(opts.folderMode ? check.moves.map((m) => m.to) : [])]);
       result.unchanged = check.unchanged.length;
       result.duplicates = check.duplicates;
@@ -156,7 +157,8 @@ export function MaterialsSection({
               } catch (e) {
                 result.errors.push({ path: item.path, message: e instanceof Error ? e.message : "Nie udało się przygotować pliku" });
               }
-              setProgress((p) => ({ ...p, done: ++done }));
+              const d = ++done;
+              setProgress((p) => ({ ...p, done: d }));
               setSummary({ ...result, duplicates: [...result.duplicates], errors: [...result.errors] });
             }
           }),
@@ -169,11 +171,20 @@ export function MaterialsSection({
       // 4) Folder: przeniesienia + pliki, których nie ma już w folderze.
       if (opts.folderMode) {
         setPhase("finishing");
-        const roots = uploadRoots(accepted);
+        const uploaded = new Set(accepted.map((f) => f.path));
+        // Bez skrótów w przeglądarce (np. strona po http) przeniesiony plik serwer zgłasza jako duplikat starego miejsca -
+        // jeśli stare miejsce jest w tym folderze, a pliku już tam nie ma, to przeniesienie.
+        const used = new Set(check.moves.map((m) => m.from));
+        const dupMoves = result.duplicates
+          .filter((d) => d.of && !uploaded.has(d.of) && roots.some((r) => d.of.startsWith(`${r}/`)) && !used.has(d.of) && Boolean(used.add(d.of)))
+          .map((d) => ({ from: d.of, to: d.path }));
+        result.duplicates = result.duplicates.filter((d) => !dupMoves.some((m) => m.to === d.path));
         const rec = await postJson<{ moved: number; stale: { id: string; path: string }[] }>("/api/knowledge/sources/reconcile", {
           roots,
-          uploaded: accepted.map((f) => f.path),
-          moves: check.moves,
+          uploaded: [...uploaded],
+          // Pominięte i nieodczytane pliki (lub całe foldery) nadal są u autora - nie pytamy o ich usunięcie.
+          unreadable: result.skipped.map((s) => s.path),
+          moves: [...check.moves, ...dupMoves],
         });
         result.moved = rec.moved;
         if (rec.stale.length) {
@@ -210,11 +221,11 @@ export function MaterialsSection({
     try {
       if (entries.length) {
         const folderMode = entries.some((en) => en.isDirectory);
-        const { files: picked, failed } = await filesFromEntries(entries, folderMode ? "" : targetFolder);
+        const { files: picked, failed } = await filesFromEntries(entries, folderMode ? "" : target);
         await upload(picked, { folderMode, failed });
       } else {
         await upload(
-          files.map((file) => ({ file, path: targetFolder ? `${targetFolder}/${file.name}` : file.name })),
+          files.map((file) => ({ file, path: target ? `${target}/${file.name}` : file.name })),
           { folderMode: false },
         );
       }
@@ -255,6 +266,8 @@ export function MaterialsSection({
     walk(tree);
     return out;
   }, [tree]);
+  // Wybrany folder docelowy mógł zostać usunięty - wtedy pliki trafiają do folderu głównego (tak jak pokazuje lista).
+  const target = folders.includes(targetFolder) ? targetFolder : "";
   const totalSize = sources.reduce((n, s) => n + s.size, 0);
   const phaseText = { collecting: "Odczytywanie folderów…", hashing: "Sprawdzanie plików", uploading: "Wgrywanie", finishing: "Porządkowanie…", deleting: "Usuwanie…", idle: "" }[phase];
 
@@ -293,7 +306,7 @@ export function MaterialsSection({
           {folders.length > 0 && (
             <label className="flex items-center gap-2 text-xs text-neutral-400">
               pojedyncze pliki do:
-              <select value={targetFolder} onChange={(e) => setTargetFolder(e.target.value)} className="max-w-56 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-200">
+              <select value={target} onChange={(e) => setTargetFolder(e.target.value)} className="max-w-56 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-200">
                 <option value="">(folder główny)</option>
                 {folders.map((f) => (
                   <option key={f} value={f}>
@@ -322,7 +335,7 @@ export function MaterialsSection({
           accept={ACCEPT_ATTR}
           className="hidden"
           onChange={(e) => {
-            const picked = filesFromInput(e.target.files, targetFolder);
+            const picked = filesFromInput(e.target.files, target);
             e.target.value = "";
             upload(picked, { folderMode: false });
           }}

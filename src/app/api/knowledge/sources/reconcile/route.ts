@@ -6,6 +6,7 @@ import { reconcileUpload } from "@/lib/knowledge";
 const Schema = z.object({
   roots: z.array(z.string().max(500)).max(100),
   uploaded: z.array(z.string().max(2000)).max(20_000),
+  unreadable: z.array(z.string().max(2000)).max(20_000).default([]),
   moves: z.array(z.object({ from: z.string().max(2000), to: z.string().max(2000) })).max(20_000),
 });
 

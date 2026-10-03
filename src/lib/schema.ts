@@ -166,6 +166,8 @@ export type SynthesisProposal = {
   synthesis: Synthesis;
   /** Materiały zmieniły się po przygotowaniu propozycji (dodane/zmienione/usunięte/przeniesione) */
   stale?: boolean;
+  /** Wersje (updatedAt) ręcznych wpisów z chwili, gdy analiza je czytała */
+  manualVersions?: Record<string, string>;
 };
 
 export type Database = {

@@ -1,6 +1,7 @@
 import "server-only";
 import { promises as fs } from "fs";
 import path from "path";
+import { basename, sanitizePath } from "./file-types";
 import { DEFAULT_CATEGORIES, type Database, type DraftEntry, type KnowledgeEntry } from "./schema";
 
 // Prosta baza w pliku JSON (data/db.json) + oryginalne materiały w data/sources.
@@ -17,7 +18,14 @@ export function normalizeDb(raw: Partial<Database> & Record<string, unknown>): D
   const db: Database = { ...empty(), ...raw } as Database;
   db.entries = db.entries ?? [];
   const sourceDefaults = { mediaType: "", storedAs: "", size: 0, notes: "", entryCount: 0, hash: "" };
-  db.sources = (db.sources ?? []).map((s) => ({ ...sourceDefaults, ...s, path: s.path || s.filename }));
+  // Ścieżki zawsze w tej samej postaci co z przeglądarki (NFC itd.) - starsze bazy mogły mieć np. NFD z macOS.
+  db.sources = (db.sources ?? []).map((s) => {
+    const p = sanitizePath(s.path || s.filename || "");
+    return { ...sourceDefaults, ...s, path: p, filename: basename(p) };
+  });
+  if (db.pendingSynthesis?.sources) {
+    db.pendingSynthesis.sources = db.pendingSynthesis.sources.map((s) => ({ ...s, path: sanitizePath(s.path) }));
+  }
   if (!db.categories || db.categories.length === 0) {
     const used = new Set(db.entries.map((e) => e.area));
     db.categories = DEFAULT_CATEGORIES.filter((c) => used.has(c.id));

@@ -105,3 +105,44 @@ describe("Excel", () => {
     expect(text).toContain("inny");
   });
 });
+
+describe("tabele Worda, wykresy, SmartArt i formaty liczb", () => {
+  it("Word: wiersz tabeli w jednej linii, puste komórki zachowują kolumny", () => {
+    const text = htmlToText(
+      "<table><tr><td><p>Cecha</p></td><td><p>Ideał</p></td><td><p>Słabo</p></td></tr><tr><td><p>Tilt</p></td><td><p></p></td><td><p>&lt; 0°</p></td></tr></table>",
+    );
+    expect(text).toContain("Cecha | Ideał | Słabo");
+    expect(text).toContain("Tilt | | < 0°");
+  });
+
+  it("PowerPoint: tekst wykresu (tytuł, serie) i diagramu SmartArt ze slajdu", async () => {
+    const data = await zipBuffer({
+      "ppt/presentation.xml": `<p:sldIdLst><p:sldId r:id="rId1"/></p:sldIdLst>`,
+      "ppt/_rels/presentation.xml.rels": rels([["rId1", "slide", "slides/slide1.xml"]]),
+      "ppt/slides/slide1.xml": `<p:sld><a:p><a:r><a:t>Proces glow-up</a:t></a:r></a:p><c:chart r:id="rC"/><dgm:relIds r:dm="rD" r:lo="rL"/></p:sld>`,
+      "ppt/slides/_rels/slide1.xml.rels": rels([
+        ["rC", "chart", "../charts/chart3.xml"],
+        ["rD", "diagramData", "../diagrams/data1.xml"],
+        ["rL", "diagramLayout", "../diagrams/layout1.xml"],
+      ]),
+      "ppt/charts/chart3.xml": `<c:chartSpace><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>FWHR wg ocen</a:t></a:r></a:p></c:rich></c:tx></c:title><c:plotArea><c:barChart><c:ser><c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>Średnia</c:v></c:pt></c:strCache></c:strRef></c:tx><c:cat><c:strRef><c:strCache><c:pt idx="0"><c:v>8/10</c:v></c:pt><c:pt idx="1"><c:v>5/10</c:v></c:pt></c:strCache></c:strRef></c:cat><c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>2.1</c:v></c:pt><c:pt idx="1"><c:v>1.8</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>`,
+      "ppt/diagrams/data1.xml": `<dgm:dataModel><dgm:ptLst><dgm:pt><dgm:t><a:p><a:r><a:t>1. Mewing 6 miesięcy</a:t></a:r></a:p></dgm:t></dgm:pt><dgm:pt><dgm:t><a:p><a:r><a:t>2. Body fat poniżej 12%</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst></dgm:dataModel>`,
+    });
+    const { text } = await extractContent({ mediaType: OFFICE.pptx, path: "a.pptx" }, data);
+    expect(text).toContain("Proces glow-up");
+    expect(text).toContain("tytuł: FWHR wg ocen");
+    expect(text).toContain("Średnia: 8/10 = 2.1; 5/10 = 1.8");
+    expect(text).toContain("1. Mewing 6 miesięcy | 2. Body fat poniżej 12%");
+  });
+
+  it("Excel: procenty, daty i liczby bez szumu zmiennoprzecinkowego wg stylów komórek", async () => {
+    const data = await zipBuffer({
+      "xl/workbook.xml": `<workbook><sheets><sheet name="Progi" sheetId="1" r:id="rId1"/></sheets></workbook>`,
+      "xl/_rels/workbook.xml.rels": rels([["rId1", "worksheet", "worksheets/sheet1.xml"]]),
+      "xl/styles.xml": `<styleSheet><numFmts count="1"><numFmt numFmtId="164" formatCode="0.0&quot; dni&quot;"/></numFmts><cellXfs count="4"><xf numFmtId="0"/><xf numFmtId="9"/><xf numFmtId="14"/><xf numFmtId="164"/></cellXfs></styleSheet>`,
+      "xl/worksheets/sheet1.xml": `<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Body fat</t></is></c><c r="B1" s="1"><v>0.12</v></c><c r="C1" s="2"><v>45123</v></c><c r="D1" s="3"><v>0.30000000000000004</v></c><c r="E1" t="str"><v>tekst</v></c></row></sheetData></worksheet>`,
+    });
+    const { text } = await extractContent({ mediaType: OFFICE.xlsx, path: "a.xlsx" }, data);
+    expect(text).toContain("Body fat | 12% | 2023-07-16 | 0.3 | tekst");
+  });
+});

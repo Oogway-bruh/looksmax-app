@@ -1,7 +1,7 @@
 import "server-only";
 import type Anthropic from "@anthropic-ai/sdk";
 import { isClientRequestError, isMissingFileError, structuredCall } from "./claude";
-import { materialsReady, resetFileIds } from "./knowledge";
+import { materialsReady, migrateLegacySources, resetFileIds } from "./knowledge";
 import { UserError } from "./errors";
 import { METRIC_INFO, formatMetric, type MetricKey, type Metrics } from "./metrics";
 import { evaluateRules } from "./rules";
@@ -90,8 +90,11 @@ function frameworkText(db: Database) {
 function analyzedSources(db: Database): KnowledgeSource[] {
   const f = db.framework;
   if (!f) return [];
-  if (f.sourceHashes) return db.sources.filter((s) => f.sourceHashes![s.id] === s.hash);
-  return db.sources.filter((s) => f.sourceIds.includes(s.id));
+  // Tak samo jak w panelu: skrót z analizy, a gdy go brak (starsza baza, import) - lista ID.
+  return db.sources.filter((s) => {
+    const h = f.sourceHashes?.[s.id];
+    return h !== undefined ? h === s.hash : f.sourceIds.includes(s.id);
+  });
 }
 
 /**
@@ -137,6 +140,8 @@ export async function analyzeFace(input: {
   samples: number;
   qualityNotes: string[];
 }): Promise<AnalysisResponse> {
+  // Materiały ze starszych wersji (np. obrazy bez znormalizowanych części) - inaczej zamiast nich poszłaby pustka.
+  await migrateLegacySources().catch(() => undefined);
   const db = await readDb();
   if (db.entries.length === 0) throw new UserError("Baza wiedzy jest pusta - najpierw dodaj materiały w panelu administratora.", 409);
 

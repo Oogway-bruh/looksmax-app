@@ -39,7 +39,8 @@ export async function POST(req: Request) {
             return to ? [[to, h]] : [];
           }),
         );
-        db.framework = { ...incoming.framework, sourceIds: ids, sourceHashes: hashes };
+        const { sourceHashes, ...framework } = incoming.framework;
+        db.framework = { ...framework, sourceIds: ids, ...(sourceHashes ? { sourceHashes: hashes } : {}) };
       } else db.framework = null;
       db.nextEntryNumber = Math.max(db.nextEntryNumber, incoming.nextEntryNumber);
       db.pendingSynthesis = null;

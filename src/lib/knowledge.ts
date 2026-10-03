@@ -105,7 +105,7 @@ export type JobState = {
   error?: string;
 };
 
-const g = globalThis as unknown as { __knowledgeJob?: JobState | null; __fileIdsRunning?: Promise<void> | null };
+const g = globalThis as unknown as { __knowledgeJob?: JobState | null; __fileIdsRunning?: Promise<void> | null; __migration?: Promise<void> | null };
 export const currentJob = () => g.__knowledgeJob ?? null;
 
 const sha256 = (data: Buffer) => createHash("sha256").update(data).digest("hex");
@@ -175,6 +175,7 @@ async function prepareFile(path: string, type: string, data: Buffer): Promise<Pr
   const parts: Prepared["parts"] = [];
   const partData: Buffer[] = [];
   let skipped = 0;
+  let unreadable = 0;
   for (const im of images) {
     if (im.data.length < MIN_EMBEDDED_BYTES) continue;
     if (parts.length >= MAX_EMBEDDED_IMAGES) {
@@ -188,10 +189,16 @@ async function prepareFile(path: string, type: string, data: Buffer): Promise<Pr
         partData.push(p.data);
       });
     } catch {
-      // Formaty bez podglądu (np. EMF/WMF) - pomijamy.
+      // Formaty bez podglądu (np. EMF/WMF - wklejone wykresy/tabele) - autor dostaje informację.
+      unreadable++;
     }
   }
-  const notes = skipped ? `pominięto ${skipped} obrazów osadzonych (limit ${MAX_EMBEDDED_IMAGES} na dokument)` : "";
+  const notes = [
+    skipped && `pominięto ${skipped} obrazów osadzonych (limit ${MAX_EMBEDDED_IMAGES} na dokument)`,
+    unreadable && `nie udało się odczytać ${unreadable} obrazów osadzonych (np. EMF/WMF) - jeśli są ważne, zapisz je jako PNG/JPG i wgraj osobno`,
+  ]
+    .filter(Boolean)
+    .join("; ");
   return { kind: "text", mediaType: detected.mediaType, parts, partData, notes };
 }
 
@@ -268,6 +275,7 @@ export async function addSource(file: { name: string; path?: string; type: strin
       invalidateProposal(db);
       return { result: { status: "updated", path, notes: source.notes }, cleanup: old };
     }
+    invalidateProposal(db);
     db.sources.push(source);
     return { result: { status: "added", path, notes: source.notes }, cleanup: null };
   });
@@ -275,13 +283,16 @@ export async function addSource(file: { name: string; path?: string; type: strin
   return decision.result;
 }
 
+const underAny = (roots: string[]) => (p: string) => roots.some((r) => p.startsWith(`${r}/`));
+
 /**
  * Wstępne sprawdzenie przed ponownym wgraniem folderu (po skrótach oryginałów z przeglądarki):
  * które pliki są bez zmian (nie trzeba ich wysyłać), które to duplikaty, a które zostały tylko przeniesione.
  */
-export async function checkUploads(files: { path: string; hash: string }[]) {
+export async function checkUploads(files: { path: string; hash: string }[], uploadRoots: string[] = []) {
   await migrateLegacySources();
   const db = await readDb();
+  const inRoots = underAny(uploadRoots.map(sanitizePath));
   const incoming = files.filter((f) => isHex64(f.hash)).map((f) => ({ path: sanitizePath(f.path), hash: f.hash }));
   const incomingHash = new Map(incoming.map((f) => [f.path, f.hash]));
   const byPath = new Map(db.sources.map((s) => [s.path, s]));
@@ -309,8 +320,8 @@ export async function checkUploads(files: { path: string; hash: string }[]) {
     const otherIncoming = incomingHash.get(other.path);
     // Plik o tej treści dostaje w tym wgraniu nową wersję - ta treść zniknie z bazy, więc to nie duplikat.
     if (otherIncoming && otherIncoming !== f.hash) continue;
-    if (!otherIncoming) {
-      // Plik zniknął ze starego miejsca i pojawił się w nowym = przeniesienie (bez ponownego wysyłania).
+    if (!otherIncoming && inRoots(other.path)) {
+      // Plik zniknął ze starego miejsca we wgrywanym folderze i pojawił się w nowym = przeniesienie (bez ponownego wysyłania).
       moves.push({ from: other.path, to: f.path });
       usedAsMove.add(other.id);
     } else {
@@ -324,22 +335,25 @@ export async function checkUploads(files: { path: string; hash: string }[]) {
  * Po wgraniu folderu: wykonuje przeniesienia plików i zwraca materiały z tych folderów, których nie było w nowej wersji
  * (np. usunięte lub przeniesione przez autora) - panel pyta, czy je usunąć.
  */
-export async function reconcileUpload(input: { roots: string[]; uploaded: string[]; moves: { from: string; to: string }[] }) {
-  const roots = input.roots.map(sanitizePath);
+export async function reconcileUpload(input: { roots: string[]; uploaded: string[]; unreadable?: string[]; moves: { from: string; to: string }[] }) {
+  const inRoots = underAny(input.roots.map(sanitizePath));
   const uploaded = new Set(input.uploaded.map(sanitizePath));
+  // Pliki i foldery, których przeglądarka nie odczytała albo które pominęliśmy - nadal są u autora, więc nie są „usunięte”.
+  const unreadable = (input.unreadable ?? []).map(sanitizePath);
+  const notRead = (p: string) => unreadable.some((u) => p === u || p.startsWith(`${u}/`));
   return updateDb((db) => {
     let moved = 0;
     for (const m of input.moves) {
       const from = sanitizePath(m.from);
       const to = sanitizePath(m.to);
       const src = db.sources.find((s) => s.path === from);
-      if (!src || db.sources.some((s) => s.path === to)) continue;
+      if (!src || uploaded.has(from) || !inRoots(from) || db.sources.some((s) => s.path === to)) continue;
       src.path = to;
       src.filename = basename(to);
       moved++;
     }
     if (moved) invalidateProposal(db);
-    const stale = db.sources.filter((s) => roots.some((r) => s.path.startsWith(`${r}/`)) && !uploaded.has(s.path)).map((s) => ({ id: s.id, path: s.path }));
+    const stale = db.sources.filter((s) => inRoots(s.path) && !uploaded.has(s.path) && !notRead(s.path)).map((s) => ({ id: s.id, path: s.path }));
     return { moved, stale };
   });
 }
@@ -370,12 +384,20 @@ export async function deleteSources(target: { id?: string; ids?: string[]; folde
   return { removedFiles: removed.files.length, removedEntries: removed.removedEntries };
 }
 
-/** Uzupełnia materiały zapisane przez starsze wersje: skróty treści i znormalizowane obrazy (≤ 2000 px). */
-export async function migrateLegacySources() {
+/**
+ * Uzupełnia materiały zapisane przez starsze wersje: skróty treści i znormalizowane obrazy (≤ 2000 px).
+ * Jedno uruchomienie naraz - równoległe żądania czekają na to samo.
+ */
+export function migrateLegacySources(): Promise<void> {
+  if (!g.__migration) g.__migration = runLegacyMigration().finally(() => (g.__migration = null));
+  return g.__migration;
+}
+
+async function runLegacyMigration() {
   const db = await readDb();
   const legacy = db.sources.filter((s) => !s.hash || (s.kind === "image" && s.parts === undefined));
   if (legacy.length === 0) return;
-  const updates = new Map<string, Partial<KnowledgeSource>>();
+  const updates = new Map<string, { patch: Partial<KnowledgeSource>; storedAs: string }>();
   for (const s of legacy) {
     const data = await readSourceFile(s.storedAs);
     if (!data) continue;
@@ -404,14 +426,21 @@ export async function migrateLegacySources() {
       if (s.fileId) await deleteFromFilesApi(s.fileId);
       patch.fileId = null;
     }
-    updates.set(s.id, patch);
+    updates.set(s.id, { patch, storedAs: s.storedAs });
   }
-  await updateDb((d) => {
+  const discarded = await updateDb((d) => {
+    const unused: Partial<KnowledgeSource>[] = [];
     for (const s of d.sources) {
-      const patch = updates.get(s.id);
-      if (patch) Object.assign(s, patch);
+      const u = updates.get(s.id);
+      if (!u) continue;
+      // Materiał podmieniony w międzyczasie (nowa wersja pliku) - łatka dotyczy starej treści.
+      if (s.storedAs !== u.storedAs || (u.patch.parts && s.parts !== undefined)) unused.push(u.patch);
+      else Object.assign(s, u.patch);
+      updates.delete(s.id);
     }
+    return [...unused, ...[...updates.values()].map((u) => u.patch)];
   });
+  for (const patch of discarded) for (const p of patch.parts ?? []) await deleteSourceFile(p.storedAs);
 }
 
 // --- Files API ---
@@ -612,7 +641,15 @@ async function runSynthesis(job: JobState) {
   job.stage = "Gotowe";
 }
 
-type Ctx = { job: JobState; structure: Block; manual: ManualEntry[]; onText: (c: string) => void };
+type Ctx = {
+  job: JobState;
+  structure: Block;
+  manual: ManualEntry[];
+  manualVersions: Record<string, string>;
+  /** Nazwy obecnych kategorii (ID → nazwa) - do dopasowania ręcznych wpisów */
+  categoryNames: Record<string, string>;
+  onText: (c: string) => void;
+};
 
 const manualBlock = (manual: ManualEntry[]): Block[] =>
   manual.length ? [{ type: "text", text: `<reczne_wpisy_autora>\n${JSON.stringify(manual, null, 1)}\n</reczne_wpisy_autora>` }] : [];
@@ -625,6 +662,8 @@ async function synthesize(job: JobState) {
     job,
     structure: folderStructureBlock(sources),
     manual: db.entries.filter((e) => e.manual).map(stripEntry),
+    manualVersions: Object.fromEntries(db.entries.filter((e) => e.manual).map((e) => [e.id, e.updatedAt])),
+    categoryNames: Object.fromEntries(db.categories.map((c) => [c.id, c.name])),
     onText: (chunk) => {
       job.outputChars += chunk.length;
     },
@@ -683,6 +722,7 @@ async function synthesize(job: JobState) {
       sources: sources.map((s) => ({ id: s.id, path: s.path, hash: s.hash })),
       synthesis: final,
       stale: false,
+      manualVersions: ctx.manualVersions,
     };
   });
 }
@@ -777,9 +817,15 @@ async function mergeParts(ctx: Ctx, parts: Synthesis[]): Promise<Synthesis> {
       byCategory.set(area, [...(byCategory.get(area) ?? []), { ...e, area }]);
     }
   });
+  // Kategoria ręcznego wpisu w nowym układzie: to samo ID albo ta sama nazwa (ID kategorii mogą się zmienić między analizami).
+  const manualArea = (m: ManualEntry) => {
+    if (catIds.has(m.area)) return m.area;
+    const names = [m.area, ctx.categoryNames[m.area]].filter(Boolean).map((n) => slugify(n));
+    return fw.categories.find((c) => names.includes(slugify(c.name)))?.id ?? null;
+  };
   // Ręczne wpisy z kategorii bez wpisów z materiałów też trafiają do scalania.
   for (const m of ctx.manual) {
-    const area = catIds.has(m.area) ? m.area : (fw.categories.find((c) => slugify(c.name) === slugify(m.area))?.id ?? null);
+    const area = manualArea(m);
     if (area && !byCategory.has(area)) byCategory.set(area, []);
   }
 
@@ -787,7 +833,7 @@ async function mergeParts(ctx: Ctx, parts: Synthesis[]): Promise<Synthesis> {
   let done = 0;
   const merged = await mapLimit(categories, 3, async (area) => {
     const entries = byCategory.get(area)!;
-    const manual = ctx.manual.filter((m) => m.area === area);
+    const manual = ctx.manual.filter((m) => manualArea(m) === area);
     const result = parts.length === 1 && manual.length === 0 ? entries : await mergeCategory(ctx, area, entries, manual);
     ctx.job.stage = `Scalanie wpisów w kategoriach: ${++done}/${categories.length}…`;
     return result;
@@ -866,8 +912,12 @@ export async function applySynthesis() {
     const existing = new Set(db.sources.map((s) => s.id));
     const resolve = (f: string) => byPath.get(sanitizePath(f)) ?? byName.get(basename(sanitizePath(f))) ?? undefined;
 
-    // Ręczne wpisy poprawione po przygotowaniu propozycji - zachowujemy je w obecnej wersji (poprawka autora nie może zginąć).
-    const editedAfter = new Set(db.entries.filter((e) => e.manual && e.updatedAt > proposal.createdAt).map((e) => e.id));
+    // Ręczne wpisy poprawione po tym, jak analiza je przeczytała (także w trakcie jej trwania) - zachowujemy obecną wersję
+    // (poprawka autora nie może zginąć).
+    const versions = proposal.manualVersions;
+    const editedAfter = new Set(
+      db.entries.filter((e) => e.manual && (versions ? versions[e.id] !== e.updatedAt : e.updatedAt > proposal.createdAt)).map((e) => e.id),
+    );
     const manualUsed = new Set(syn.entries.flatMap((e) => e.fromManual).filter((id) => !editedAfter.has(id)));
     let droppedDeleted = 0;
     const created = syn.entries.flatMap(({ sourceFiles, fromManual, topic, ...draft }) => {

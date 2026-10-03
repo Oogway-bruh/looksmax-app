@@ -49,6 +49,8 @@ export function htmlToText(html: string): string {
     .replace(/<!--[\s\S]*?-->/g, "")
     .replace(/<(script|style|head|title|noscript|template|svg)[\s\S]*?<\/\1>/gi, "")
     .replace(/<br\s*\/?>/gi, "\n")
+    // Akapit kończący komórkę tabeli (Word) to granica komórek, nie nowa linia.
+    .replace(/<\/p>\s*(?=<\/t[dh]>)/gi, "")
     .replace(/<\/(td|th)>/gi, " | ")
     .replace(/<\/(p|div|h[1-6]|li|tr|table|section|article|blockquote|pre|dt|dd|header|footer)>/gi, "\n")
     .replace(/<li[^>]*>/gi, "• ")
@@ -208,6 +210,46 @@ function drawingXmlToText(xml: string): string {
     .trim();
 }
 
+/** Wykres: tytuł i serie danych (kategoria = wartość). */
+function chartXmlToText(xml: string): string {
+  const points = (block: string) =>
+    [...block.matchAll(/<c:pt\b[^>]*\bidx="(\d+)"[^>]*>\s*(?:<c:formatCode>[^<]*<\/c:formatCode>\s*)?<c:v>([^<]*)<\/c:v>/g)].map(
+      (m) => [Number(m[1]), decodeEntities(m[2])] as const,
+    );
+  const titleXml = xml.match(/<c:title>[\s\S]*?<\/c:title>/)?.[0] ?? "";
+  const title = (drawingXmlToText(titleXml) || decodeEntities(titleXml.match(/<c:v>([^<]*)<\/c:v>/)?.[1] ?? "")).replace(/\n/g, " ");
+  const series: string[] = [];
+  for (const ser of xml.matchAll(/<c:ser>([\s\S]*?)<\/c:ser>/g)) {
+    const tx = ser[1].match(/<c:tx>([\s\S]*?)<\/c:tx>/)?.[1] ?? "";
+    const name = points(tx).map(([, v]) => v).join(" ") || decodeEntities(tx.match(/<c:v>([^<]*)<\/c:v>/)?.[1] ?? "");
+    const cats = new Map(points(ser[1].match(/<c:(cat|xVal)>[\s\S]*?<\/c:\1>/)?.[0] ?? ""));
+    const vals = points(ser[1].match(/<c:(val|yVal)>[\s\S]*?<\/c:\1>/)?.[0] ?? "");
+    const data = vals.map(([i, v]) => (cats.has(i) ? `${cats.get(i)} = ${v}` : v)).join("; ");
+    if (name || data) series.push(`${name || "seria"}: ${data}`);
+  }
+  return [title && `tytuł: ${title}`, ...series].filter(Boolean).join("\n");
+}
+
+/**
+ * Tekst wykresów i diagramów SmartArt powiązanych z częścią dokumentu (slajdem, treścią Worda) - są w osobnych
+ * plikach paczki, więc zwykły odczyt tekstu ich nie widzi.
+ */
+async function graphicsText(zip: JSZipType, rels: Map<string, { target: string; type: string }>): Promise<string[]> {
+  const list = [...rels.values()];
+  // Diagram ma dwie wersje tego samego tekstu (dane i rysunek) - bierzemy jedną.
+  const hasDrawing = list.some((r) => r.type.endsWith("/diagramDrawing"));
+  const out: string[] = [];
+  for (const r of list) {
+    const isChart = r.type.endsWith("/chart");
+    const isDiagram = r.type.endsWith("/diagramDrawing") || (!hasDrawing && r.type.endsWith("/diagramData"));
+    if (!isChart && !isDiagram) continue;
+    const xml = await readXml(zip, r.target);
+    const text = isChart ? chartXmlToText(xml) : drawingXmlToText(xml).replace(/\n+/g, " | ");
+    if (text.trim()) out.push(`[${isChart ? "wykres" : "diagram SmartArt"}: ${text.replace(/\n/g, " ; ")}]`);
+  }
+  return out;
+}
+
 export type EmbeddedImage = { path: string; label: string };
 
 /** Slajdy w kolejności prezentacji (presentation.xml), z notatkami prelegenta i listą obrazów. */
@@ -228,6 +270,7 @@ async function pptx(zip: JSZipType): Promise<{ text: string; images: EmbeddedIma
     const xml = await readXml(zip, slide);
     const rels = await readRels(zip, slide);
     let text = `--- Slajd ${i + 1} ---\n${drawingXmlToText(xml)}`;
+    for (const g of await graphicsText(zip, rels)) text += `\n${g}`;
     const notesRel = [...rels.values()].find((r) => r.type.endsWith("/notesSlide"));
     if (notesRel) {
       const notes = drawingXmlToText(await readXml(zip, notesRel.target))
@@ -245,6 +288,28 @@ async function pptx(zip: JSZipType): Promise<{ text: string; images: EmbeddedIma
     }
   }
   return { text: parts.join("\n\n"), images };
+}
+
+/**
+ * Liczby tak, jak widzi je autor w Excelu: procenty (0.12 → 12%), daty (numer dnia → RRRR-MM-DD), bez szumu
+ * zmiennoprzecinkowego (0.30000000000000004 → 0.3).
+ */
+async function numberFormatter(zip: JSZipType): Promise<(raw: string, style?: string) => string> {
+  const styles = await readXml(zip, "xl/styles.xml");
+  const custom = new Map([...styles.matchAll(/<numFmt\b[^>]*\bnumFmtId="(\d+)"[^>]*\bformatCode="([^"]*)"/g)].map((m) => [Number(m[1]), decodeEntities(m[2])]));
+  const xfs = [...(styles.match(/<cellXfs\b[\s\S]*?<\/cellXfs>/)?.[0] ?? "").matchAll(/<xf\b([^>]*)/g)].map((m) => Number(m[1].match(/\bnumFmtId="(\d+)"/)?.[1] ?? 0));
+  return (raw, style) => {
+    const n = Number(raw);
+    if (raw.trim() === "" || !Number.isFinite(n)) return unescapeOoxml(decodeEntities(raw));
+    const id = xfs[Number(style ?? 0)] ?? 0;
+    // Kod formatu bez tekstów w cudzysłowach, [kolorów/walut] i znaków ucieczki.
+    const code = (custom.get(id) ?? "").replace(/"[^"]*"|\[[^\]]*\]|\\./g, "");
+    if (id === 9 || id === 10 || code.includes("%")) return `${+(n * 100).toPrecision(12)}%`;
+    if (((id >= 14 && id <= 17) || id === 22 || /[dy]/i.test(code)) && n > 0 && n < 2958466) {
+      return new Date(Math.round((n - 25569) * 864e5)).toISOString().slice(0, id === 22 || /h/i.test(code) ? 16 : 10).replace("T", " ");
+    }
+    return String(+n.toPrecision(15));
+  };
 }
 
 /** Arkusze w kolejności skoroszytu, komórki na właściwych kolumnach (puste komórki nie przesuwają danych). */
@@ -270,6 +335,7 @@ async function xlsx(zip: JSZipType): Promise<{ text: string; images: EmbeddedIma
       .sort((a, b) => num(a) - num(b))
       .map((target, i) => ({ name: sheets[i]?.name || String(i + 1), target }));
   }
+  const fmtNumber = await numberFormatter(zip);
   const colIndex = (ref: string) => {
     const letters = ref.match(/^[A-Z]+/i)?.[0].toUpperCase() ?? "A";
     return [...letters].reduce((n, c) => n * 26 + (c.charCodeAt(0) - 64), 0) - 1;
@@ -294,7 +360,7 @@ async function xlsx(zip: JSZipType): Promise<{ text: string; images: EmbeddedIma
         if (t === "s" && v != null) value = shared[Number(v)] ?? "";
         else if (t === "inlineStr") value = unescapeOoxml([...inner.matchAll(/<t(?:\s[^>]*)?>([^<]*)<\/t>/g)].map((x) => decodeEntities(x[1])).join(""));
         else if (t === "b") value = v === "1" ? "PRAWDA" : "FAŁSZ";
-        else if (v != null) value = unescapeOoxml(decodeEntities(v));
+        else if (v != null) value = t === "str" || t === "e" || t === "d" ? unescapeOoxml(decodeEntities(v)) : fmtNumber(v, attrs.match(/\bs="(\d+)"/)?.[1]);
         cells[col] = value;
       }
       const filled = Array.from(cells, (x) => x ?? "");
@@ -302,6 +368,15 @@ async function xlsx(zip: JSZipType): Promise<{ text: string; images: EmbeddedIma
       if (filled.some((x) => x.trim())) rows.push(filled.join(" | "));
     }
     out.push(`--- Arkusz: ${sheet.name} ---\n${rows.join("\n")}`);
+  }
+  // Wykresy w skoroszycie (tytuły i serie).
+  const num = (n: string) => Number(n.match(/(\d+)\.xml$/)?.[1] ?? 0);
+  const charts = Object.keys(zip.files)
+    .filter((n) => /^xl\/charts\/chart\d+\.xml$/.test(n))
+    .sort((a, b) => num(a) - num(b));
+  for (const [i, c] of charts.entries()) {
+    const text = chartXmlToText(await readXml(zip, c));
+    if (text) out.push(`--- Wykres ${i + 1} ---\n${text}`);
   }
   // Obrazy osadzone w arkuszach (rysunki).
   const images = Object.keys(zip.files)
@@ -322,7 +397,8 @@ async function docx(zip: JSZipType, data: Buffer): Promise<{ text: string; image
     const rel = rels.get(m[1]);
     if (rel && rel.type.endsWith("/image") && !images.some((im) => im.path === rel.target)) images.push({ path: rel.target, label: `obraz ${images.length + 1}` });
   }
-  return { text: htmlToText(html), images };
+  const graphics = await graphicsText(zip, rels);
+  return { text: [htmlToText(html), ...(graphics.length ? ["--- Wykresy i diagramy w dokumencie ---", ...graphics] : [])].join("\n\n"), images };
 }
 
 export type Extracted = { text: string; images: { data: Buffer; label: string }[] };

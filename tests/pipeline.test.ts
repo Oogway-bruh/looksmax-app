@@ -112,7 +112,7 @@ describe("wgrywanie i porządkowanie materiałów", () => {
       { path: "K/Nos/Szerokosc/nos.txt", hash: hex("c") }, // przeniesiony
       { path: "K/Nowe/1.txt", hash: hex("d") }, // nowy
       { path: "K/Nowe/2.txt", hash: hex("d") }, // duplikat w tym samym wgraniu
-    ]);
+    ], ["K"]);
     expect(check.unchanged).toEqual(["K/Oczy/tilt.txt"]);
     expect(check.moves).toEqual([{ from: "K/Nos/nos.txt", to: "K/Nos/Szerokosc/nos.txt" }]);
     expect(check.duplicates).toEqual([{ path: "K/Nowe/2.txt", of: "K/Nowe/1.txt" }]);
@@ -214,6 +214,117 @@ describe("zatwierdzanie propozycji po zmianach w materiałach", () => {
     expect(titles).toContain("z obu");
     expect(db.entries.find((e) => e.id === manualId)?.content).toBe("v2 poprawione");
     expect(db.framework?.sourceHashes?.[db.sources.find((s) => s.path === "Z/bb.txt")!.id]).toBeTruthy();
+  });
+});
+
+describe("poprawki z drugiego przeglądu", () => {
+  it("wielostronicowy TIFF daje wszystkie strony", async () => {
+    const page = (c: number) => sharp({ create: { width: 400, height: 500, channels: 3, background: { r: c, g: c, b: c } } });
+    const pages = await Promise.all([10, 120, 240].map((c) => page(c).png().toBuffer()));
+    const tiff = await sharp(pages, { join: { animated: true } }).tiff().toBuffer();
+    expect((await sharp(tiff).metadata()).pages).toBe(3);
+    const norm = await normalizeImage(tiff);
+    expect(norm.parts).toHaveLength(3);
+  });
+
+  it("przeniesienie tylko w obrębie wgrywanego folderu; pliki spoza niego to duplikaty", async () => {
+    const add = (p: string, h: string) => knowledge.addSource({ name: p.split("/").pop()!, path: p, type: "text/plain", data: Buffer.from(p), originalHash: hex(h) });
+    await add("A1/x.txt", "1");
+    await add("B1/Sub/y.txt", "2");
+    const check = await knowledge.checkUploads(
+      [
+        { path: "B1/x.txt", hash: hex("1") }, // ta sama treść co A1/x.txt, ale A1 nie jest wgrywany
+        { path: "B1/Nowy/y.txt", hash: hex("2") }, // przeniesione w obrębie B1
+      ],
+      ["B1"],
+    );
+    expect(check.moves).toEqual([{ from: "B1/Sub/y.txt", to: "B1/Nowy/y.txt" }]);
+    expect(check.duplicates).toEqual([{ path: "B1/x.txt", of: "A1/x.txt" }]);
+  });
+
+  it("uporządkowanie: nieodczytane pliki/foldery nie są zgłaszane jako usunięte; przeniesienia spoza folderu są ignorowane", async () => {
+    const add = (p: string, h: string) => knowledge.addSource({ name: p.split("/").pop()!, path: p, type: "text/plain", data: Buffer.from(p), originalHash: hex(h) });
+    await add("R1/ok.txt", "3");
+    await add("R1/chmura/a.txt", "4");
+    await add("R1/duzy.txt", "5");
+    await add("R1/stary.txt", "6");
+    await add("Inny/z.txt", "7");
+    const rec = await knowledge.reconcileUpload({
+      roots: ["R1"],
+      uploaded: ["R1/ok.txt", "R1/z.txt"],
+      unreadable: ["R1/chmura", "R1/duzy.txt"],
+      moves: [{ from: "Inny/z.txt", to: "R1/z.txt" }],
+    });
+    expect(rec.moved).toBe(0);
+    expect(rec.stale.map((s) => s.path)).toEqual(["R1/stary.txt"]);
+    expect((await store.readDb()).sources.some((s) => s.path === "Inny/z.txt")).toBe(true);
+  });
+
+  it("ścieżki ze starszych baz (NFD z macOS) są ujednolicane do NFC", () => {
+    const nfd = "Wiedza/Skóra/żel.txt".normalize("NFD");
+    const db = store.normalizeDb({ sources: [{ id: "S1", path: nfd, filename: "żel.txt".normalize("NFD") }] } as never);
+    expect(db.sources[0].path).toBe("Wiedza/Skóra/żel.txt".normalize("NFC"));
+    expect(db.sources[0].filename).toBe("żel.txt".normalize("NFC"));
+  });
+
+  it("równoległe wywołania migracji czekają na jedno uruchomienie", () => {
+    const a = knowledge.migrateLegacySources();
+    const b = knowledge.migrateLegacySources();
+    expect(a).toBe(b);
+    return Promise.all([a, b]);
+  });
+
+  it("dodanie nowego pliku oznacza oczekującą propozycję jako nieaktualną", async () => {
+    await store.updateDb((d) => {
+      d.pendingSynthesis = {
+        createdAt: new Date().toISOString(),
+        mode: "full",
+        materialTokens: 1,
+        basedOn: [],
+        sourceIds: [],
+        synthesis: { framework: { summary: "", scoringNotes: "" }, categories: [], entries: [], contradictions: [], gaps: [], unreadable: [] },
+        stale: false,
+      };
+    });
+    const r = await knowledge.addSource({ name: "nowy.txt", path: "P1/nowy.txt", type: "text/plain", data: Buffer.from("nowa wiedza"), originalHash: hex("9") });
+    expect(r.status).toBe("added");
+    expect((await store.readDb()).pendingSynthesis?.stale).toBe(true);
+    await knowledge.rejectSynthesis();
+  });
+
+  it("ręczny wpis poprawiony w trakcie analizy zostaje w poprawionej wersji", async () => {
+    const id = await store.updateDb((d) => {
+      const e = store.newEntry(d, { area: "x", title: "ręczny 2", content: "v1", assessmentCriteria: "", metric: null, ranges: [], recommendations: [], priority: 3 }, [], true);
+      e.updatedAt = "2003-01-01T00:00:00.000Z";
+      d.entries.push(e);
+      return e.id;
+    });
+    // Poprawka w trakcie analizy: updatedAt wcześniejszy niż zapis propozycji, ale inny niż wersja, którą analiza przeczytała.
+    await store.updateDb((d) => {
+      d.entries.find((e) => e.id === id)!.content = "v2 w trakcie";
+      d.entries.find((e) => e.id === id)!.updatedAt = "2003-06-01T00:00:00.000Z";
+      d.pendingSynthesis = {
+        createdAt: "2004-01-01T00:00:00.000Z",
+        mode: "full",
+        materialTokens: 1,
+        basedOn: d.entries.map((e) => e.id),
+        sourceIds: d.sources.map((s) => s.id),
+        sources: d.sources.map((s) => ({ id: s.id, path: s.path, hash: s.hash })),
+        manualVersions: { [id]: "2003-01-01T00:00:00.000Z" },
+        synthesis: {
+          framework: { summary: "", scoringNotes: "" },
+          categories: [{ id: "x", name: "X", description: "", weight: 3 }],
+          entries: [
+            { area: "x", topic: "", title: "scalony", content: "v1", assessmentCriteria: "", metric: null, ranges: [], recommendations: [], priority: 3, sourceFiles: [], fromManual: [id] },
+          ],
+          contradictions: [],
+          gaps: [],
+          unreadable: [],
+        },
+      };
+    });
+    await knowledge.applySynthesis();
+    expect((await store.readDb()).entries.find((e) => e.id === id)?.content).toBe("v2 w trakcie");
   });
 });
 
