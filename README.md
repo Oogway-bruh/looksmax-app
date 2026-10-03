@@ -1,36 +1,49 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Analiza twarzy według własnej bazy wiedzy
 
-## Getting Started
+Aplikacja webowa: użytkownik wgrywa zdjęcie twarzy, a dostaje ocenę i listę zmian opartą **wyłącznie na Twojej
+bazie wiedzy**, a nie na ogólnie przyjętych kanonach czy wiedzy z internetu.
 
-First, run the development server:
+## Jak to działa
+
+1. **Pomiary (przeglądarka, bez AI).** MediaPipe Face Landmarker wykrywa 478 punktów twarzy, a kod liczy
+   16 pomiarów: nachylenie oczu, FWHR, midface ratio, ESR, proporcje nosa, ust, tercji i żuchwy, indeks asymetrii
+   ([`src/lib/metrics.ts`](src/lib/metrics.ts)).
+2. **Silnik reguł (serwer, bez AI).** Wpisy z bazy, które mają przypisany pomiar i progi, są oceniane przez kod -
+   deterministycznie i tylko według Twoich progów ([`src/lib/rules.ts`](src/lib/rules.ts)).
+3. **Claude (serwer).** Dostaje zdjęcie, pomiary, wyniki reguł i całą bazę wiedzy. Ma zakaz używania wiedzy spoza
+   bazy i każde zalecenie musi podpisać ID wpisu (np. `K012`). Kod odrzuca każde zalecenie bez pokrycia w
+   istniejących wpisach ([`src/lib/analyze.ts`](src/lib/analyze.ts)).
+
+## Baza wiedzy (`/admin`)
+
+- **Wgrywanie materiałów:** .txt / .md, zdjęcia notatek/grafik, PDF. Claude czyta każdy plik i zamienia go na
+  uporządkowane wpisy (obszar, zasada, kryteria oceny, opcjonalnie progi liczbowe, zalecenia, priorytet 1-5),
+  bez dodawania czegokolwiek od siebie.
+- **Porządkowanie:** przycisk „Uporządkuj bazę” łączy duplikaty z różnych materiałów, oznacza sprzeczności
+  (nie rozstrzyga ich za Ciebie) i ustawia priorytety. Przed każdą zmianą kopia bazy trafia do `data/backups/`.
+- **Ręczna edycja** każdego wpisu, w tym progów dla pomiarów, oraz eksport/import całej bazy jako JSON.
+
+Baza jest przechowywana w pliku `data/db.json` (poza gitem).
+
+## Uruchomienie lokalne
 
 ```bash
+npm install            # pobiera też model MediaPipe do public/mediapipe
+cp .env.example .env.local   # uzupełnij ANTHROPIC_API_KEY i ADMIN_PASSWORD
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+- http://localhost:3000 - analiza zdjęcia
+- http://localhost:3000/admin - baza wiedzy (hasło z `ADMIN_PASSWORD`; w trybie dev bez hasła)
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Prywatność
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Zdjęcie jest przetwarzane tylko w pamięci na potrzeby jednej analizy i nie jest zapisywane. Użytkownik musi
+potwierdzić, że ma 18+ i zgadza się na przetworzenie zdjęcia. Przed publicznym startem potrzebna jest polityka
+prywatności (dane biometryczne, art. 9 RODO).
 
-## Learn More
+## Wdrożenie - do zrobienia
 
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Plikowa baza działa na serwerze ze stałym dyskiem (VPS, Railway, Render z dyskiem). Przy hostingu bez dysku
+(np. Vercel) trzeba wymienić `src/lib/store.ts` na Postgresa (np. Supabase) - reszta kodu korzysta tylko z
+funkcji `readDb` / `updateDb`.
