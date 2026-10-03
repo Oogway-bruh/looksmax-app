@@ -64,18 +64,32 @@ export const KnowledgeEntrySchema = DraftEntrySchema.extend({
   updatedAt: z.string(),
   /** Wpis dodany lub poprawiony ręcznie - ponowna analiza materiałów go zachowuje */
   manual: z.boolean().optional(),
+  /** Temat wg struktury folderów autora, np. "Oczy › Canthal tilt" */
+  topic: z.string().optional(),
 });
 
 export type KnowledgeEntry = z.infer<typeof KnowledgeEntrySchema>;
 
 export type KnowledgeSource = {
   id: string;
+  /** Ścieżka względna z folderami, np. "Looksmax/Oczy/canthal.txt" (identyfikuje materiał) */
+  path: string;
+  /** Sama nazwa pliku */
   filename: string;
   kind: "text" | "image" | "pdf";
   mediaType: string;
   /** Plik w data/sources */
   storedAs: string;
   size: number;
+  /** SHA-256 treści - do wykrywania duplikatów i zmian */
+  hash: string;
+  /** Wymiary obrazu (do szacowania kosztu w tokenach) */
+  width?: number;
+  height?: number;
+  /** Przybliżona liczba stron PDF */
+  pages?: number;
+  /** ID pliku w Anthropic Files API (obrazy i PDF-y) - żeby nie wysyłać ich za każdym razem */
+  fileId?: string | null;
   uploadedAt: string;
   /** Ile wpisów wskazuje ten materiał jako źródło (po ostatniej analizie) */
   entryCount: number;
@@ -111,11 +125,12 @@ export const SynthesisSchema = z.object({
     .describe("Kategorie oceny wynikające z materiałów"),
   entries: z.array(
     DraftEntrySchema.extend({
-      sourceFiles: z.array(z.string()).describe("Nazwy plików, z których pochodzi wpis"),
+      topic: z.string().describe("Temat wg struktury folderów autora, np. 'Oczy › Canthal tilt' (foldery oddzielone ›); pusty string, jeśli brak folderów"),
+      sourceFiles: z.array(z.string()).describe("Pełne ścieżki plików (z folderami, dokładnie jak w materiałach), z których pochodzi wpis"),
       fromManual: z.array(z.string()).describe("ID ręcznych wpisów autora uwzględnionych w tym wpisie"),
     }),
   ),
-  contradictions: z.array(z.string()).describe("Sprzeczności między materiałami - z nazwami plików"),
+  contradictions: z.array(z.string()).describe("Sprzeczności między materiałami - ze ścieżkami plików"),
   gaps: z.array(z.string()).describe("Czego brakuje, żeby oceniać twarz wg tych materiałów (np. brak kryteriów dla jakiejś cechy, brak progów)"),
   unreadable: z.array(z.string()).describe("Pliki lub fragmenty nieczytelne/niezrozumiałe"),
 });

@@ -1,11 +1,21 @@
 import "server-only";
 import type Anthropic from "@anthropic-ai/sdk";
-import { structuredCall } from "./claude";
+import { isMissingFileError, structuredCall } from "./claude";
+import { prepareMaterialsForAnalysis } from "./knowledge";
 import { UserError } from "./http";
 import { METRIC_INFO, formatMetric, type MetricKey, type Metrics } from "./metrics";
 import { evaluateRules } from "./rules";
 import { allSourceBlocks } from "./materials";
-import { AnalysisSchema, VERDICT_LABELS, categoryName, type AnalysisResponse, type Category, type Database, type KnowledgeEntry, type RuleResult } from "./schema";
+import {
+  AnalysisSchema,
+  VERDICT_LABELS,
+  categoryName,
+  type AnalysisResponse,
+  type Category,
+  type Database,
+  type KnowledgeEntry,
+  type RuleResult,
+} from "./schema";
 import { buildReport } from "./scoring";
 import { readDb } from "./store";
 
@@ -44,7 +54,10 @@ export function knowledgeForAnalysis(entries: KnowledgeEntry[], categories: Cate
       entries
         .filter((e) => e.area === area)
         .map((e) => {
-          const lines = [`[${e.id}] ${e.title} (kategoria: ${categoryName(categories, e.area)}, priorytet ${e.priority}/5)`, `Zasada: ${e.content}`];
+          const where = [`kategoria: ${categoryName(categories, e.area)}`, e.topic ? `temat: ${e.topic}` : "", `priorytet ${e.priority}/5`]
+            .filter(Boolean)
+            .join(", ");
+          const lines = [`[${e.id}] ${e.title} (${where})`, `Zasada: ${e.content}`];
           if (e.assessmentCriteria) lines.push(`Jak oceniać: ${e.assessmentCriteria}`);
           if (e.metric && e.ranges.length) {
             const unit = METRIC_INFO[e.metric].unit;
@@ -64,7 +77,9 @@ function frameworkText(db: Database) {
     f?.summary ? `Założenia autora:\n${f.summary}` : "",
     f?.scoringNotes ? `Jak autor ocenia:\n${f.scoringNotes}` : "",
     cats ? `Kategorie oceny:\n${cats}` : "",
-    f?.contradictions.length ? `Sprzeczności w materiałach (nie rozstrzygaj ich, zaznacz niepewność):\n${f.contradictions.map((c) => `- ${c}`).join("\n")}` : "",
+    f?.contradictions.length
+      ? `Sprzeczności w materiałach (nie rozstrzygaj ich, zaznacz niepewność):\n${f.contradictions.map((c) => `- ${c}`).join("\n")}`
+      : "",
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -73,6 +88,10 @@ function frameworkText(db: Database) {
 /** Czy dołączać pełne materiały: tylko gdy są przeanalizowane i mieszczą się w limicie. */
 function shouldIncludeMaterials(db: Database) {
   if (db.sources.length === 0) return false;
+  const images = db.sources.filter((s) => s.kind === "image").length;
+  const pages = db.sources.reduce((n, s) => n + (s.kind === "pdf" ? (s.pages ?? 1) : 0), 0);
+  // Limity API na zapytanie: 600 obrazów i 600 stron PDF (z zapasem na zdjęcia twarzy).
+  if (images > 300 || pages > 300) return false;
   const tokens = db.framework?.materialTokens;
   if (tokens != null) return tokens <= FULL_MATERIALS_LIMIT;
   return db.sources.reduce((s, x) => s + x.size, 0) < 1_500_000;
@@ -89,7 +108,10 @@ function measurementsText(metrics: Metrics, spreads: Partial<Record<MetricKey, n
 function rulesText(rules: RuleResult[]) {
   if (rules.length === 0) return "Brak wpisów z regułami liczbowymi.";
   return rules
-    .map((r) => `- ${r.entryId} (${r.title}): ${formatMetric(r.metric, r.value)} → ${VERDICT_LABELS[r.verdict]} (${r.score}/10)${r.borderline ? " [na granicy przedziału]" : ""}`)
+    .map(
+      (r) =>
+        `- ${r.entryId} (${r.title}): ${formatMetric(r.metric, r.value)} → ${VERDICT_LABELS[r.verdict]} (${r.score}/10)${r.borderline ? " [na granicy przedziału]" : ""}`,
+    )
     .join("\n");
 }
 
@@ -108,53 +130,66 @@ export async function analyzeFace(input: {
 
   const rules = evaluateRules(db.entries, input.metrics, input.spreads);
 
-  const content: Anthropic.Beta.BetaContentBlockParam[] = [];
   const includeMaterials = shouldIncludeMaterials(db);
-  if (includeMaterials) {
-    const materials = await allSourceBlocks(db.sources);
-    content.push({ type: "text", text: "<materialy_autora>" }, ...materials, { type: "text", text: "</materialy_autora>" });
-    // Materiały są takie same dla każdej analizy - cache obniża koszt i czas kolejnych analiz.
-    const last = content[content.length - 1] as Anthropic.Beta.BetaTextBlockParam;
-    last.cache_control = { type: "ephemeral" };
-  }
-  content.push(
-    { type: "text", text: "Zdjęcie przodu twarzy:" },
-    { type: "image", source: { type: "base64", media_type: input.front.mediaType, data: input.front.data } },
-  );
-  if (input.profile) {
+  const run = async (forceReupload: boolean) => {
+    const content: Anthropic.Beta.BetaContentBlockParam[] = [];
+    if (includeMaterials) {
+      // Obrazy i PDF-y przez Files API - zapytanie zostaje małe nawet przy wielu plikach.
+      await prepareMaterialsForAnalysis(forceReupload);
+      const materials = await allSourceBlocks((await readDb()).sources);
+      content.push({ type: "text", text: "<materialy_autora>" }, ...materials, { type: "text", text: "</materialy_autora>" });
+      // Materiały są takie same dla każdej analizy - cache obniża koszt i czas kolejnych analiz.
+      const last = content[content.length - 1] as Anthropic.Beta.BetaTextBlockParam;
+      last.cache_control = { type: "ephemeral" };
+    }
     content.push(
-      { type: "text", text: "Zdjęcie profilu:" },
-      { type: "image", source: { type: "base64", media_type: input.profile.mediaType, data: input.profile.data } },
+      { type: "text", text: "Zdjęcie przodu twarzy:" },
+      { type: "image", source: { type: "base64", media_type: input.front.mediaType, data: input.front.data } },
     );
-  }
-  content.push({
-    type: "text",
-    text: [
-      `<pomiary>\n${measurementsText(input.metrics, input.spreads, input.samples)}\n</pomiary>`,
-      `<wyniki_regul>\n${rulesText(rules)}\n</wyniki_regul>`,
-      input.qualityNotes.length ? `<jakosc_zdjecia>\n${input.qualityNotes.join("\n")}\n</jakosc_zdjecia>` : "",
-      input.profile ? "" : "Brak zdjęcia profilu - cechy widoczne tylko z boku oznacz jako not_visible lub oceń z niską pewnością.",
-      `Oceń tę twarz według bazy wiedzy - wszystkie ${db.entries.length} wpisów.`,
-    ]
-      .filter(Boolean)
-      .join("\n\n"),
-  });
+    if (input.profile) {
+      content.push(
+        { type: "text", text: "Zdjęcie profilu:" },
+        { type: "image", source: { type: "base64", media_type: input.profile.mediaType, data: input.profile.data } },
+      );
+    }
+    content.push({
+      type: "text",
+      text: [
+        `<pomiary>\n${measurementsText(input.metrics, input.spreads, input.samples)}\n</pomiary>`,
+        `<wyniki_regul>\n${rulesText(rules)}\n</wyniki_regul>`,
+        input.qualityNotes.length ? `<jakosc_zdjecia>\n${input.qualityNotes.join("\n")}\n</jakosc_zdjecia>` : "",
+        input.profile ? "" : "Brak zdjęcia profilu - cechy widoczne tylko z boku oznacz jako not_visible lub oceń z niską pewnością.",
+        `Oceń tę twarz według bazy wiedzy - wszystkie ${db.entries.length} wpisów.`,
+      ]
+        .filter(Boolean)
+        .join("\n\n"),
+    });
 
-  const analysis = await structuredCall({
-    schema: AnalysisSchema,
-    system: [
-      { type: "text", text: ANALYSIS_SYSTEM },
-      // Baza jest taka sama dla każdego użytkownika - cache obniża koszt i czas kolejnych analiz.
-      {
-        type: "text",
-        text: `<system_oceny_autora>\n${frameworkText(db)}\n</system_oceny_autora>\n\n<baza_wiedzy>\n${knowledgeForAnalysis(db.entries, db.categories)}\n</baza_wiedzy>`,
-        cache_control: { type: "ephemeral" },
-      },
-    ],
-    content,
-    effort: "high",
-    maxTokens: 128000,
-  });
+    return structuredCall({
+      schema: AnalysisSchema,
+      system: [
+        { type: "text", text: ANALYSIS_SYSTEM },
+        // Baza jest taka sama dla każdego użytkownika - cache obniża koszt i czas kolejnych analiz.
+        {
+          type: "text",
+          text: `<system_oceny_autora>\n${frameworkText(db)}\n</system_oceny_autora>\n\n<baza_wiedzy>\n${knowledgeForAnalysis(db.entries, db.categories)}\n</baza_wiedzy>`,
+          cache_control: { type: "ephemeral" },
+        },
+      ],
+      content,
+      effort: "high",
+      maxTokens: 128000,
+    });
+  };
+
+  let analysis;
+  try {
+    analysis = await run(false);
+  } catch (err) {
+    // Pliki w Files API zniknęły (np. zmiana klucza API) - wgrywamy je ponownie i próbujemy raz jeszcze.
+    if (!includeMaterials || !isMissingFileError(err)) throw err;
+    analysis = await run(true);
+  }
 
   return buildReport(db.entries, analysis, rules, db.categories, includeMaterials);
 }

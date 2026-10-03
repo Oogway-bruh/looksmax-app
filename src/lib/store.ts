@@ -16,8 +16,8 @@ const empty = (): Database => ({ entries: [], categories: [], sources: [], frame
 export function normalizeDb(raw: Partial<Database> & Record<string, unknown>): Database {
   const db: Database = { ...empty(), ...raw } as Database;
   db.entries = db.entries ?? [];
-  const sourceDefaults = { mediaType: "", storedAs: "", size: 0, notes: "", entryCount: 0 };
-  db.sources = (db.sources ?? []).map((s) => ({ ...sourceDefaults, ...s }));
+  const sourceDefaults = { mediaType: "", storedAs: "", size: 0, notes: "", entryCount: 0, hash: "" };
+  db.sources = (db.sources ?? []).map((s) => ({ ...sourceDefaults, ...s, path: s.path || s.filename }));
   if (!db.categories || db.categories.length === 0) {
     const used = new Set(db.entries.map((e) => e.area));
     db.categories = DEFAULT_CATEGORIES.filter((c) => used.has(c.id));

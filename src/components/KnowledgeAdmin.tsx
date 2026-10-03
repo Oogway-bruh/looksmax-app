@@ -1,15 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { MaterialsSection } from "./MaterialsSection";
 import { METRIC_INFO, METRIC_KEYS, type MetricKey } from "@/lib/metrics";
 import { VERDICTS, VERDICT_LABELS, categoryName, type Category, type Database, type DraftEntry, type KnowledgeEntry, type SynthesisProposal } from "@/lib/schema";
 
 type JobState = { status: "running" | "done" | "error"; startedAt: string; stage: string; outputChars: number; error?: string };
 type AdminData = Database & { job: JobState | null; apiKeyConfigured: boolean };
-type UploadStatus = { name: string; state: "waiting" | "working" | "done" | "error"; message?: string };
 
-const UPLOAD_CONCURRENCY = 3;
-const ACCEPT = ".txt,.md,.csv,.json,.docx,.pdf,.jpg,.jpeg,.png,.webp,text/*,image/jpeg,image/png,image/webp,application/pdf";
 
 class SessionError extends Error {}
 
@@ -24,26 +22,6 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
   return json;
 }
 
-/** Duże zdjęcia zmniejszamy w przeglądarce (limit API to 5 MB na obraz; 2400 px wystarcza do odczytu notatek). */
-async function prepareFile(file: File): Promise<File> {
-  if (!/^image\/(jpeg|png|webp)$/.test(file.type)) return file;
-  const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" }).catch(() => null);
-  if (!bitmap) return file;
-  const maxSide = 2400;
-  if (file.size < 3.5 * 1024 * 1024 && Math.max(bitmap.width, bitmap.height) <= maxSide) return file;
-  const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.round(bitmap.width * scale);
-  canvas.height = Math.round(bitmap.height * scale);
-  canvas.getContext("2d")!.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-  const blob = await new Promise<Blob | null>((r) => canvas.toBlob(r, "image/jpeg", 0.9));
-  if (!blob) return file;
-  return new File([blob], file.name.replace(/\.(png|webp|jpeg)$/i, ".jpg"), { type: "image/jpeg" });
-}
-
-const formatSize = (b: number) => (b > 1024 * 1024 ? `${(b / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(b / 1024))} KB`);
-const KIND_LABEL = { text: "tekst", image: "obraz", pdf: "PDF" } as const;
-
 const card = "rounded-2xl border border-neutral-800 bg-neutral-900/60 p-6 space-y-4";
 const button = "rounded-lg bg-sky-500 px-4 py-2 font-semibold text-neutral-950 hover:bg-sky-400 disabled:opacity-50";
 const ghost = "rounded-lg border border-neutral-700 px-4 py-2 hover:bg-neutral-800 disabled:opacity-50";
@@ -52,14 +30,10 @@ const EMPTY_DRAFT: DraftEntry = { area: "", title: "", content: "", assessmentCr
 
 export function KnowledgeAdmin() {
   const [db, setDb] = useState<AdminData | null>(null);
-  const [uploads, setUploads] = useState<UploadStatus[]>([]);
-  const [uploading, setUploading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [editing, setEditing] = useState<string | null>(null);
-  const [dragOver, setDragOver] = useState(false);
-  const fileInput = useRef<HTMLInputElement>(null);
 
   const reload = useCallback(() => api<AdminData>("/api/knowledge").then(setDb), []);
   useEffect(() => {
@@ -73,31 +47,6 @@ export function KnowledgeAdmin() {
     const t = setInterval(() => reload().catch(() => undefined), 2000);
     return () => clearInterval(t);
   }, [running, reload]);
-
-  async function uploadFiles(files: File[]) {
-    if (files.length === 0) return;
-    setUploads(files.map((f) => ({ name: f.name, state: "waiting" })));
-    setUploading(true);
-    let next = 0;
-    const worker = async () => {
-      while (next < files.length) {
-        const i = next++;
-        const set = (s: Partial<UploadStatus>) => setUploads((u) => u.map((x, j) => (j === i ? { ...x, ...s } : x)));
-        set({ state: "working" });
-        try {
-          const form = new FormData();
-          form.append("file", await prepareFile(files[i]));
-          await api("/api/knowledge/sources", { method: "POST", body: form });
-          set({ state: "done" });
-        } catch (e) {
-          set({ state: "error", message: (e as Error).message });
-        }
-      }
-    };
-    await Promise.all(Array.from({ length: Math.min(UPLOAD_CONCURRENCY, files.length) }, worker));
-    setUploading(false);
-    await reload();
-  }
 
   async function action(fn: () => Promise<unknown>, done?: string) {
     setBusy(true);
@@ -118,11 +67,6 @@ export function KnowledgeAdmin() {
       () => api("/api/knowledge/synthesize", { method: accept ? "PUT" : "DELETE" }),
       accept ? "Zatwierdzono. Analiza twarzy korzysta teraz z nowego systemu oceny. Kopia poprzedniej bazy jest w data/backups." : "Propozycja odrzucona - baza bez zmian.",
     );
-
-  async function deleteSource(id: string, name: string) {
-    if (!confirm(`Usunąć materiał „${name}”? Wpisy, które pochodzą tylko z niego, też znikną.`)) return;
-    await action(() => api(`/api/knowledge/sources/${id}`, { method: "DELETE" }));
-  }
 
   async function importFile(file: File) {
     if (!confirm("Zastąpić obecne wpisy i kategorie zawartością pliku? Kopia obecnej bazy trafi do data/backups.")) return;
@@ -173,7 +117,7 @@ export function KnowledgeAdmin() {
     );
   }
 
-  const sourceName = new Map(db.sources.map((s) => [s.id, s.filename]));
+  const sourceName = new Map(db.sources.map((s) => [s.id, s.path]));
   const analyzedIds = new Set(db.framework?.sourceIds ?? []);
   const newSources = db.sources.filter((s) => !analyzedIds.has(s.id));
   const removedSinceAnalysis = (db.framework?.sourceIds ?? []).filter((id) => !db.sources.some((s) => s.id === id)).length;
@@ -195,76 +139,7 @@ export function KnowledgeAdmin() {
         </div>
       )}
 
-      <section className={card}>
-        <h2 className="text-lg font-semibold">1. Twoje materiały</h2>
-        <p className="text-sm text-neutral-400">
-          Wrzuć wszystko, z czego ma korzystać ocena: notatki, poradniki, zrzuty ekranu, zdjęcia kartek, tabele, PDF-y, pliki Word i tekstowe. Możesz zaznaczyć wiele
-          plików naraz albo przeciągnąć je tutaj. Pliki są przechowywane w całości.
-        </p>
-        <div
-          onDragOver={(e) => {
-            e.preventDefault();
-            setDragOver(true);
-          }}
-          onDragLeave={() => setDragOver(false)}
-          onDrop={(e) => {
-            e.preventDefault();
-            setDragOver(false);
-            uploadFiles(Array.from(e.dataTransfer.files));
-          }}
-          onClick={() => fileInput.current?.click()}
-          className={`cursor-pointer rounded-xl border-2 border-dashed p-8 text-center transition ${dragOver ? "border-sky-400 bg-sky-500/10" : "border-neutral-700 hover:border-sky-500/60"}`}
-        >
-          <p className="font-medium">{uploading ? "Wgrywanie…" : "Kliknij albo przeciągnij pliki"}</p>
-          <p className="mt-1 text-xs text-neutral-500">.txt .md .csv .docx .pdf .jpg .png .webp</p>
-          <input
-            ref={fileInput}
-            type="file"
-            multiple
-            accept={ACCEPT}
-            className="hidden"
-            onChange={(e) => {
-              uploadFiles(Array.from(e.target.files ?? []));
-              e.target.value = "";
-            }}
-          />
-        </div>
-        {uploads.some((u) => u.state !== "done") && (
-          <ul className="space-y-1 text-sm">
-            {uploads
-              .filter((u) => u.state !== "done")
-              .map((u, i) => (
-                <li key={`${u.name}-${i}`}>
-                  <span className="font-mono">{u.name}</span> -{" "}
-                  <span className={u.state === "error" ? "text-red-300" : "text-neutral-400"}>{{ waiting: "czeka", working: "wgrywanie…", done: "", error: "błąd" }[u.state]}</span>
-                  {u.message && <span className="text-red-300"> · {u.message}</span>}
-                </li>
-              ))}
-          </ul>
-        )}
-        {db.sources.length > 0 && (
-          <ul className="divide-y divide-neutral-800 text-sm">
-            {db.sources.map((s) => (
-              <li key={s.id} className="flex items-center justify-between gap-3 py-2">
-                <div className="min-w-0">
-                  <a href={`/api/knowledge/sources/${s.id}`} target="_blank" className="font-mono hover:text-sky-300">
-                    {s.filename}
-                  </a>
-                  <span className="ml-2 text-xs text-neutral-500">
-                    {KIND_LABEL[s.kind]} · {formatSize(s.size)}
-                    {analyzedIds.has(s.id) ? ` · ${s.entryCount} wpisów` : ""}
-                  </span>
-                  {!analyzedIds.has(s.id) && <span className="ml-2 rounded bg-sky-500/15 px-1.5 py-0.5 text-xs text-sky-300">nowy - jeszcze nieprzeanalizowany</span>}
-                  {s.notes && <p className="text-xs text-amber-300/80">Uwagi: {s.notes}</p>}
-                </div>
-                <button onClick={() => deleteSource(s.id, s.filename)} disabled={busy || running} className="shrink-0 text-red-400 hover:text-red-300 disabled:opacity-40">
-                  Usuń
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+      <MaterialsSection sources={db.sources} analyzedIds={analyzedIds} disabled={busy || running} onChanged={reload} />
 
       <section className={card}>
         <h2 className="text-lg font-semibold">2. Analiza materiałów</h2>
@@ -409,7 +284,8 @@ function ProposalView({ proposal, db, busy, onDecide }: { proposal: SynthesisPro
                 <ul className="mt-1 space-y-1">
                   {list.map((e, i) => (
                     <li key={i} className="text-neutral-300">
-                      <b>{e.title}</b> <span className="text-neutral-500">- {e.content.slice(0, 160)}{e.content.length > 160 ? "…" : ""}</span>
+                      <b>{e.title}</b>
+                      {e.topic && <span className="text-xs text-neutral-500"> [{e.topic}]</span>} <span className="text-neutral-500">- {e.content.slice(0, 160)}{e.content.length > 160 ? "…" : ""}</span>
                     </li>
                   ))}
                 </ul>
@@ -529,6 +405,7 @@ function EntryCard({ entry: e, sources, onEdit, onDelete }: { entry: KnowledgeEn
       <summary className="cursor-pointer">
         <span className="mr-2 font-mono text-xs text-neutral-500">{e.id}</span>
         <span className="font-medium">{e.title}</span>
+        {e.topic && <span className="ml-2 text-xs text-neutral-500">{e.topic}</span>}
         <span className="ml-2 text-xs text-amber-300">{"★".repeat(Math.max(1, Math.min(5, Math.round(e.priority))))}</span>
         {e.metric && <span className="ml-2 rounded bg-sky-500/10 px-1.5 py-0.5 text-xs text-sky-300">{METRIC_INFO[e.metric].label}</span>}
         {e.manual && <span className="ml-2 rounded bg-amber-500/10 px-1.5 py-0.5 text-xs text-amber-300">poprawione ręcznie</span>}
